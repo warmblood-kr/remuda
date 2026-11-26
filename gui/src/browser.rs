@@ -16,16 +16,17 @@ use std::{
     sync::{mpsc, Arc},
 };
 
-use crate::browser_media;
 #[cfg(any(target_os = "macos", windows))]
 use crate::native_document;
 use crate::terminal_view::{self, Screen, Viewport};
+use crate::{browser_media, document_split::DocumentSplit};
 
 const SPLIT_WIDTH: f32 = 1120.;
 const SIDEBAR_WIDTH: f32 = 208.;
 
 struct Document {
     uri: String,
+    revision: String,
     media: browser_media::Document,
     request: Option<DocumentRequest>,
     #[cfg(any(target_os = "macos", windows))]
@@ -300,7 +301,6 @@ enum Content {
 #[cfg(any(target_os = "macos", windows))]
 #[derive(Default)]
 struct NativeHtml {
-    source: Option<Arc<DriveSource>>,
     selected: bool,
     failed: bool,
     opening: bool,
@@ -310,15 +310,35 @@ struct NativeHtml {
 
 #[cfg(any(target_os = "macos", windows))]
 impl NativeHtml {
-    fn clear(&mut self, cx: &App) {
-        if let Some(mut preview) = self.preview.take() {
+    fn hide(&mut self, cx: &App) {
+        self.opening = false;
+        if let Some(preview) = &mut self.preview {
             preview.hide(cx);
         }
-        self.selected = false;
-        self.failed = false;
-        self.opening = false;
-        self.receipt_deadline = None;
     }
+}
+
+struct DocumentTab {
+    generation: u64,
+    document: Document,
+    pending_presentation: Option<DocumentRequest>,
+    painted: Rc<Cell<bool>>,
+    scroll: gpui::ScrollHandle,
+    zoom: f32,
+    #[cfg(any(target_os = "macos", windows))]
+    native_html: NativeHtml,
+}
+
+impl DocumentTab {
+    fn unseen(&self) -> bool {
+        self.pending_presentation.is_some() && !self.painted.get()
+    }
+}
+
+enum BrowserMode {
+    Standalone,
+    Local,
+    Ssh,
 }
 
 pub(crate) struct Browser {
@@ -326,22 +346,18 @@ pub(crate) struct Browser {
     embedded: bool,
     documents: mpsc::Receiver<Document>,
     displayed: mpsc::Sender<DocumentRequest>,
-    document: Option<Document>,
-    pending_presentation: Option<DocumentRequest>,
-    painted: Rc<Cell<bool>>,
+    document_tabs: Vec<DocumentTab>,
+    document_index: usize,
     active: Content,
     show_drive: bool,
     drive: Option<Drive>,
     assets: Option<Assets>,
     #[cfg(any(target_os = "macos", windows))]
-    native_html: NativeHtml,
+    native_source: Option<Arc<DriveSource>>,
     document_generation: u64,
-    document_scroll: gpui::ScrollHandle,
     drive_scroll: gpui::ScrollHandle,
-    zoom: f32,
     last_input: Option<Instant>,
-    split_fraction: f32,
-    dragging_split: bool,
+    document_split: DocumentSplit,
     terminal: Option<PtyAgent>,
     screen: Screen,
     terminal_scroll: terminal_view::HistoryScroll,
@@ -409,7 +425,15 @@ pub fn open(
                     }
                 })
                 .detach();
-                Browser::new(destination, false, client, terminal, screen, focus, cx)
+                Browser::new(
+                    destination,
+                    BrowserMode::Standalone,
+                    client,
+                    terminal,
+                    screen,
+                    focus,
+                    cx,
+                )
             })
         },
     )
@@ -420,7 +444,7 @@ pub fn open(
 impl Browser {
     fn new(
         destination: String,
-        embedded: bool,
+        mode: BrowserMode,
         client: Option<Client>,
         terminal: Option<PtyAgent>,
         screen: Screen,
@@ -435,36 +459,29 @@ impl Browser {
         }
         let source = remote
             .map(DriveSource::Remote)
-            .or_else(|| embedded.then_some(DriveSource::Local))
+            .or_else(|| matches!(mode, BrowserMode::Local).then_some(DriveSource::Local))
             .map(Arc::new);
         let drive = source.clone().map(Drive::new);
         let assets = source.clone().map(Assets::new);
         #[cfg(any(target_os = "macos", windows))]
-        let native_html = NativeHtml {
-            source: source.filter(|_| native_document::enabled()),
-            ..NativeHtml::default()
-        };
+        let native_source = source.filter(|_| native_document::enabled());
         Self {
             destination,
-            embedded,
+            embedded: !matches!(mode, BrowserMode::Standalone),
             documents,
             displayed,
-            document: None,
-            pending_presentation: None,
-            painted: Default::default(),
+            document_tabs: Vec::new(),
+            document_index: 0,
             active: Content::Terminal,
             show_drive: false,
             drive,
             assets,
             #[cfg(any(target_os = "macos", windows))]
-            native_html,
+            native_source,
             document_generation: 0,
-            document_scroll: Default::default(),
             drive_scroll: Default::default(),
-            zoom: 1.,
             last_input: None,
-            split_fraction: 0.5,
-            dragging_split: false,
+            document_split: Default::default(),
             terminal,
             screen,
             terminal_scroll: Default::default(),
@@ -481,7 +498,19 @@ impl Browser {
     pub(crate) fn local(client: Option<Client>, focus: FocusHandle, cx: &mut App) -> Self {
         Self::new(
             String::new(),
-            true,
+            BrowserMode::Local,
+            client,
+            None,
+            Screen::default(),
+            focus,
+            cx,
+        )
+    }
+
+    pub(crate) fn ssh(client: Option<Client>, focus: FocusHandle, cx: &mut App) -> Self {
+        Self::new(
+            String::new(),
+            BrowserMode::Ssh,
             client,
             None,
             Screen::default(),
@@ -493,15 +522,8 @@ impl Browser {
     #[cfg(test)]
     pub(crate) fn seed_test_document(&mut self, window: &mut Window, cx: &mut App) {
         let uri = "remuda:///pilot/plan.md".to_owned();
-        let media = browser_media::decode("pilot/plan.md", b"# Design plan").unwrap();
         self.open_document(
-            Document {
-                uri,
-                media,
-                request: None,
-                #[cfg(any(target_os = "macos", windows))]
-                html: None,
-            },
+            read(|_| Ok(b"# Design plan".to_vec()), uri, None).unwrap(),
             true,
             window,
             cx,
@@ -516,10 +538,22 @@ impl Browser {
         self.active == Content::Document
     }
     pub(crate) fn has_document(&self) -> bool {
-        self.document.is_some()
+        !self.document_tabs.is_empty()
     }
     pub(crate) fn unseen_document(&self) -> bool {
-        self.pending_presentation.is_some() && !self.painted.get()
+        self.document_tabs.iter().any(DocumentTab::unseen)
+    }
+    fn document_tab(&self) -> Option<&DocumentTab> {
+        self.document_tabs.get(self.document_index)
+    }
+    fn document_tab_mut(&mut self) -> Option<&mut DocumentTab> {
+        self.document_tabs.get_mut(self.document_index)
+    }
+    fn switch_document_tab(&mut self, index: usize, cx: &App) {
+        if index != self.document_index {
+            self.hide_native_document(cx);
+            self.document_index = index;
+        }
     }
     pub(crate) fn owns_document_focus(&self, window: &Window, cx: &App) -> bool {
         self.document_focus.contains_focused(window, cx)
@@ -555,22 +589,26 @@ impl Browser {
     }
 
     pub(crate) fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.painted.get() && self.pending_presentation.take().is_some() {
-            cx.notify();
-        }
-        #[cfg(any(target_os = "macos", windows))]
-        if self.native_html.selected && self.pending_presentation.is_some() {
-            if self
-                .native_html
-                .receipt_deadline
-                .is_some_and(|deadline| Instant::now() >= deadline)
-            {
-                self.pending_presentation = None;
+        for (index, tab) in self.document_tabs.iter_mut().enumerate() {
+            if tab.painted.get() && tab.pending_presentation.take().is_some() {
                 cx.notify();
-            } else if self.native_html.preview.is_some() {
-                // Check the native view on the next real Document paint.
-                window.refresh();
             }
+            #[cfg(any(target_os = "macos", windows))]
+            if tab.native_html.selected && tab.unseen() {
+                if tab
+                    .native_html
+                    .receipt_deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    tab.pending_presentation = None;
+                    cx.notify();
+                } else if index == self.document_index && tab.native_html.preview.is_some() {
+                    // Check the native view on the next real Document paint.
+                    window.refresh();
+                }
+            }
+            #[cfg(not(any(target_os = "macos", windows)))]
+            let _ = index;
         }
         if let Ok(document) = self.documents.try_recv() {
             let typing = (self.embedded || self.focus.is_focused(window))
@@ -644,11 +682,13 @@ impl Browser {
         }
         if let Some(assets) = &self.assets {
             while let Ok((generation, media)) = assets.results.try_recv() {
-                if generation == self.document_generation {
-                    if let Some(document) = &mut self.document {
-                        document.media = media;
-                        cx.notify();
-                    }
+                if let Some(tab) = self
+                    .document_tabs
+                    .iter_mut()
+                    .find(|tab| tab.generation == generation)
+                {
+                    tab.document.media = media;
+                    cx.notify();
                 }
             }
         }
@@ -664,43 +704,62 @@ impl Browser {
         window: &mut Window,
         cx: &mut App,
     ) {
-        if self
-            .document
-            .as_ref()
-            .is_none_or(|current| current.uri != document.uri)
-        {
-            self.zoom = 1.;
-            self.document_scroll.set_offset(gpui::point(px(0.), px(0.)));
-        }
-        if document.request.is_some()
-            || self
-                .document
-                .as_ref()
-                .is_none_or(|current| current.uri != document.uri)
-        {
-            self.pending_presentation = document.request.clone();
-            self.painted = Default::default();
-        }
-        self.document_generation = self.document_generation.wrapping_add(1);
+        let mut document = document;
+        let request = document.request.take();
         #[cfg(any(target_os = "macos", windows))]
+        let native_enabled = self.native_source.is_some();
+        let existing = self
+            .document_tabs
+            .iter()
+            .position(|tab| tab.document.uri == document.uri);
+        if let Some(index) = existing
+            .filter(|&index| self.document_tabs[index].document.revision == document.revision)
         {
-            self.native_html.clear(cx);
-            self.native_html.selected =
-                document.html.is_some() && self.native_html.source.is_some();
-            if self.native_html.selected && self.pending_presentation.is_some() {
-                self.native_html.receipt_deadline =
-                    Some(Instant::now() + remuda_native::net::browser::DELIVERY_TTL);
+            self.switch_document_tab(index, cx);
+            let tab = &mut self.document_tabs[index];
+            if request.is_some() {
+                tab.pending_presentation = request;
+                tab.painted = Default::default();
+                #[cfg(any(target_os = "macos", windows))]
+                if tab.native_html.selected {
+                    tab.native_html.receipt_deadline =
+                        Some(Instant::now() + remuda_native::net::browser::DELIVERY_TTL);
+                }
             }
-        }
-        if document.media.asset_paths().next().is_some() {
-            if let Some(assets) = &self.assets {
-                let _ = assets
-                    .requests
-                    .try_send((self.document_generation, document.media.clone()));
+        } else {
+            self.hide_native_document(cx);
+            self.document_generation = self.document_generation.wrapping_add(1);
+            if document.media.asset_paths().next().is_some() {
+                if let Some(assets) = &self.assets {
+                    let _ = assets
+                        .requests
+                        .try_send((self.document_generation, document.media.clone()));
+                }
             }
-        }
-        if let Some(previous) = self.document.replace(document) {
-            previous.media.release_images(window);
+            #[cfg(any(target_os = "macos", windows))]
+            let native_html = NativeHtml {
+                selected: document.html.is_some() && native_enabled,
+                receipt_deadline: (document.html.is_some() && native_enabled && request.is_some())
+                    .then(|| Instant::now() + remuda_native::net::browser::DELIVERY_TTL),
+                ..NativeHtml::default()
+            };
+            let tab = DocumentTab {
+                generation: self.document_generation,
+                document,
+                pending_presentation: request,
+                painted: Default::default(),
+                scroll: Default::default(),
+                zoom: 1.,
+                #[cfg(any(target_os = "macos", windows))]
+                native_html,
+            };
+            self.document_index = existing.unwrap_or(self.document_tabs.len());
+            if let Some(index) = existing {
+                let previous = std::mem::replace(&mut self.document_tabs[index], tab);
+                previous.document.media.release_images(window);
+            } else {
+                self.document_tabs.push(tab);
+            }
         }
         if focus {
             self.active = Content::Document;
@@ -711,15 +770,20 @@ impl Browser {
     }
 
     fn close_document(&mut self, window: &mut Window, cx: &mut App) {
-        if let Some(document) = self.document.take() {
-            document.media.release_images(window);
+        if !self.has_document() {
+            return;
         }
-        self.document_generation = self.document_generation.wrapping_add(1);
-        #[cfg(any(target_os = "macos", windows))]
-        self.native_html.clear(cx);
-        self.pending_presentation = None;
-        self.active = Content::Terminal;
-        self.focus.focus(window, cx);
+        self.hide_native_document(cx);
+        let closed = self.document_tabs.remove(self.document_index);
+        closed.document.media.release_images(window);
+        if self.document_tabs.is_empty() {
+            self.document_index = 0;
+            self.active = Content::Terminal;
+            self.focus.focus(window, cx);
+        } else {
+            self.document_index = self.document_index.min(self.document_tabs.len() - 1);
+            self.document_focus.focus(window, cx);
+        }
     }
 
     fn refresh_terminal(&mut self, cx: &mut Context<Self>) {
@@ -1135,21 +1199,19 @@ impl Browser {
 
     pub(crate) fn hide_native_document(&mut self, cx: &App) {
         #[cfg(any(target_os = "macos", windows))]
-        {
-            self.native_html.opening = false;
-            if let Some(preview) = &mut self.native_html.preview {
-                preview.hide(cx);
-            }
+        if let Some(tab) = self.document_tab_mut() {
+            tab.native_html.hide(cx);
         }
         #[cfg(not(any(target_os = "macos", windows)))]
         let _ = cx;
     }
 
     #[cfg(any(target_os = "macos", windows))]
-    fn native_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn native_panel(tab: &DocumentTab, cx: &mut Context<Self>) -> AnyElement {
         let view = cx.weak_entity();
-        let generation = self.document_generation;
-        let element = self
+        let generation = tab.generation;
+        let painted = tab.painted.clone();
+        let element = tab
             .native_html
             .preview
             .as_ref()
@@ -1168,38 +1230,37 @@ impl Browser {
                             return;
                         }
                         let _ = view.update(app, |this, cx| {
-                            if this.document_generation != generation || !this.native_html.selected
-                            {
+                            let Some(tab) = this.document_tab_mut().filter(|tab| {
+                                tab.generation == generation && tab.native_html.selected
+                            }) else {
                                 return;
-                            }
-                            if let Some(preview) = &this.native_html.preview {
-                                if this.pending_presentation.is_some()
-                                    && !this.painted.get()
-                                    && preview.observe_presentation(cx)
-                                {
-                                    this.acknowledge_document(generation);
+                            };
+                            if let Some(preview) = &tab.native_html.preview {
+                                if tab.unseen() && preview.observe_presentation(cx) {
+                                    this.acknowledge_document(generation, &painted);
                                 }
                                 return;
                             }
-                            if this.native_html.opening {
+                            if tab.native_html.opening {
                                 return;
                             }
-                            this.native_html.opening = true;
+                            tab.native_html.opening = true;
                             let view = view.clone();
                             window.on_next_frame(move |window, app| {
                                 let _ = view.update(app, |this, cx| {
-                                    if this.document_generation != generation
-                                        || !std::mem::take(&mut this.native_html.opening)
-                                    {
+                                    let Some(source) = this.native_source.clone() else {
+                                        return;
+                                    };
+                                    let Some(tab) = this
+                                        .document_tab_mut()
+                                        .filter(|tab| tab.generation == generation)
+                                    else {
+                                        return;
+                                    };
+                                    if !std::mem::take(&mut tab.native_html.opening) {
                                         return;
                                     }
-                                    let Some(document) = &this.document else {
-                                        return;
-                                    };
-                                    let Some(html) = document.html.clone() else {
-                                        return;
-                                    };
-                                    let Some(source) = this.native_html.source.clone() else {
+                                    let Some(html) = tab.document.html.clone() else {
                                         return;
                                     };
                                     let asset: native_document::ReadAsset =
@@ -1207,16 +1268,17 @@ impl Browser {
                                     match native_document::Preview::open(
                                         window,
                                         cx,
-                                        &document.uri,
+                                        &tab.document.uri,
                                         html,
                                         asset,
                                     ) {
-                                        Ok(preview) => this.native_html.preview = Some(preview),
+                                        Ok(preview) => tab.native_html.preview = Some(preview),
                                         Err(error) => {
                                             eprintln!("remuda: native document preview: {error}");
-                                            this.native_html.selected = false;
-                                            this.native_html.failed = true;
-                                            this.pending_presentation = None;
+                                            tab.native_html.selected = false;
+                                            tab.native_html.failed = true;
+                                            // The Reader can acknowledge the document after its own paint.
+                                            tab.painted = Default::default();
                                         }
                                     }
                                     cx.notify();
@@ -1231,44 +1293,105 @@ impl Browser {
             .into_any_element()
     }
 
-    fn acknowledge_document(&self, generation: u64) {
-        if generation != self.document_generation {
+    fn acknowledge_document(&self, generation: u64, painted: &Rc<Cell<bool>>) {
+        let Some(tab) = self
+            .document_tab()
+            .filter(|tab| tab.generation == generation && Rc::ptr_eq(&tab.painted, painted))
+        else {
             return;
-        }
-        if let Some(request) = self.pending_presentation.as_ref().filter(|request| {
-            self.document
-                .as_ref()
-                .is_some_and(|document| request.uri == document.uri)
-        }) {
-            if !self.painted.replace(true) {
+        };
+        if let Some(request) = tab
+            .pending_presentation
+            .as_ref()
+            .filter(|r| r.uri == tab.document.uri)
+        {
+            if !painted.replace(true) {
                 let _ = self.displayed.send(request.clone());
             }
         }
     }
 
-    pub(crate) fn document_panel(&mut self, pane_width: f32, cx: &mut Context<Self>) -> AnyElement {
-        let Some(document) = self.document.as_ref() else {
+    fn document_tab_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let count = self.document_tabs.len();
+        Tabs::new("document-tabs")
+            .flex()
+            .flex_none()
+            .min_w_0()
+            .overflow_x_scroll()
+            .gap_1()
+            .px_2()
+            .bg(rgb(0xe5e8e8))
+            .children(self.document_tabs.iter().enumerate().map(|(index, tab)| {
+                let generation = tab.generation;
+                let title = tab.document.media.title.clone();
+                let label = if tab.unseen() {
+                    format!("{title} •")
+                } else {
+                    title
+                };
+                Tab::new(("document-tab", generation as usize))
+                    .debug_selector(move || format!("document-tab-{generation}"))
+                    .selected(index == self.document_index)
+                    .set_position(index + 1, count)
+                    .styles(|style| {
+                        style.selected(|style| style.bg(rgb(0x365370)).text_color(rgb(0xf4f6fc)))
+                    })
+                    .px_2()
+                    .py_1()
+                    .max_w(px(176.))
+                    .flex_none()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(0x52647a)).text_color(rgb(0xf4f6fc)))
+                    .child(div().truncate().child(label))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(index) = this
+                            .document_tabs
+                            .iter()
+                            .position(|tab| tab.generation == generation)
+                        {
+                            this.switch_document_tab(index, cx);
+                            cx.notify();
+                        }
+                    }))
+            }))
+            .into_any_element()
+    }
+
+    pub(crate) fn document_panel(
+        &mut self,
+        pane_width: f32,
+        dragging: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // The OS-owned HTML surface receives pointer events. Hide it while
+        // dragging so the GPUI divider can follow the pointer over the pane.
+        if dragging {
+            self.hide_native_document(cx);
+        }
+        let Some(tab) = self.document_tab() else {
             return div()
                 .flex_1()
                 .p_6()
                 .child("Open a document from Drive")
                 .into_any_element();
         };
+        let document = &tab.document;
         #[cfg(any(target_os = "macos", windows))]
-        let reader_active = !self.native_html.selected;
+        let reader_active = !tab.native_html.selected;
         #[cfg(not(any(target_os = "macos", windows)))]
         let reader_active = true;
-        let presentation = (reader_active
-            && self.pending_presentation.is_some()
-            && !self.painted.get())
-        .then(|| {
+        let presentation = (reader_active && tab.unseen()).then(|| {
             let view = cx.weak_entity();
-            let generation = self.document_generation;
+            let generation = tab.generation;
+            let painted = tab.painted.clone();
             gpui::canvas(
                 |_, _, _| (),
                 move |bounds, _, _, app| {
                     if bounds.size.width > px(0.) && bounds.size.height > px(0.) {
-                        let _ = view.update(app, |this, _| this.acknowledge_document(generation));
+                        let _ = view.update(app, |this, _| {
+                            this.acknowledge_document(generation, &painted)
+                        });
                     }
                 },
             )
@@ -1280,7 +1403,7 @@ impl Browser {
         let view = cx.weak_entity();
         let body = document.media.render(
             (pane_width - 48.).max(100.),
-            self.zoom,
+            tab.zoom,
             move |path, _, app| {
                 let _ = view.update(app, |this, cx| {
                     this.visit(format!("remuda:///{path}"), false);
@@ -1290,7 +1413,7 @@ impl Browser {
         );
         let fallback = || {
             crate::scroll_area(
-                &self.document_scroll,
+                &tab.scroll,
                 ScrollbarMode::Always,
                 div()
                     .id(gpui::SharedString::from(format!(
@@ -1300,7 +1423,7 @@ impl Browser {
                     .flex_1()
                     .min_h_0()
                     .overflow_scroll()
-                    .track_scroll(&self.document_scroll)
+                    .track_scroll(&tab.scroll)
                     .debug_selector(|| "browser-document-scroll".into())
                     .p_6()
                     .child(body),
@@ -1308,27 +1431,36 @@ impl Browser {
             .into_any_element()
         };
         #[cfg(any(target_os = "macos", windows))]
-        let (body, preview_button) = if self.native_html.source.is_some() && document.html.is_some()
-        {
-            let label = if self.native_html.selected {
+        let (body, preview_button) = if self.native_source.is_some() && document.html.is_some() {
+            let label = if tab.native_html.selected {
                 "Reader"
             } else {
                 "Native preview"
             };
             let button = action_button("native-preview", label).on_click(cx.listener(
                 |this, _, window, cx| {
-                    this.native_html.selected = !this.native_html.selected;
-                    this.native_html.failed = false;
-                    if !this.native_html.selected {
-                        this.pending_presentation = None;
-                        this.hide_native_document(cx);
+                    let Some(tab) = this.document_tab_mut() else {
+                        return;
+                    };
+                    tab.native_html.selected = !tab.native_html.selected;
+                    tab.native_html.failed = false;
+                    if !tab.native_html.selected {
+                        tab.native_html.hide(cx);
+                    }
+                    if tab.unseen() {
+                        // Invalidate a callback scheduled by the previous renderer.
+                        tab.painted = Default::default();
                     }
                     this.document_focus.focus(window, cx);
                     cx.notify();
                 },
             ));
-            let body = if self.native_html.selected {
-                self.native_panel(cx)
+            let body = if tab.native_html.selected {
+                if dragging {
+                    div().flex_1().into_any_element()
+                } else {
+                    Self::native_panel(tab, cx)
+                }
             } else {
                 fallback()
             };
@@ -1351,6 +1483,9 @@ impl Browser {
             .text_color(rgb(0x1c2327))
             .relative()
             .track_focus(&self.document_focus)
+            .when(self.document_tabs.len() > 1, |pane| {
+                pane.child(self.document_tab_bar(cx))
+            })
             .child(
                 div()
                     .flex()
@@ -1370,7 +1505,9 @@ impl Browser {
                             action_button("zoom-in", "+")
                                 .accessibility_label("Zoom in")
                                 .on_click(cx.listener(|this, event, window, cx| {
-                                    this.zoom = (this.zoom * 1.25).min(8.);
+                                    if let Some(tab) = this.document_tab_mut() {
+                                        tab.zoom = (tab.zoom * 1.25).min(8.);
+                                    }
                                     if !matches!(event, gpui::ClickEvent::Keyboard(_)) {
                                         this.document_focus.focus(window, cx);
                                     }
@@ -1379,7 +1516,9 @@ impl Browser {
                         )
                         .child(action_button("zoom-fit", "Fit").on_click(cx.listener(
                             |this, event, window, cx| {
-                                this.zoom = 1.;
+                                if let Some(tab) = this.document_tab_mut() {
+                                    tab.zoom = 1.;
+                                }
                                 if !matches!(event, gpui::ClickEvent::Keyboard(_)) {
                                     this.document_focus.focus(window, cx);
                                 }
@@ -1413,7 +1552,7 @@ impl Browser {
                 {
                     #[cfg(any(target_os = "macos", windows))]
                     {
-                        self.native_html.failed
+                        tab.native_html.failed
                     }
                     #[cfg(not(any(target_os = "macos", windows)))]
                     {
@@ -1521,14 +1660,17 @@ fn read(
         .path;
     let bytes = load(&uri)?;
     let media = browser_media::decode(&path, &bytes)?;
+    let revision = remuda_native::cluster::vfs::sha256_hex(&bytes);
     #[cfg(any(target_os = "macos", windows))]
-    let html = (request.is_none()
-        && path.rsplit_once('.').is_some_and(|(_, extension)| {
+    let html = path
+        .rsplit_once('.')
+        .is_some_and(|(_, extension)| {
             extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm")
-        }))
-    .then(|| Arc::from(bytes));
+        })
+        .then(|| Arc::from(bytes));
     Ok(Document {
         uri,
+        revision,
         media,
         request,
         #[cfg(any(target_os = "macos", windows))]
@@ -1583,17 +1725,14 @@ fn button(
 impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let wide =
-            Self::wide(window) && self.document.is_some() && self.terminal.is_some() && self.split;
-        let has_unseen = self.pending_presentation.as_ref().is_some_and(|request| {
-            self.document
-                .as_ref()
-                .is_some_and(|doc| doc.uri == request.uri)
-        });
+            Self::wide(window) && self.has_document() && self.terminal.is_some() && self.split;
+        let has_unseen = self.unseen_document();
         let available = f32::from(window.viewport_size().width) - SIDEBAR_WIDTH;
-        let document_width = if wide {
-            (available - 5.) * (1. - self.split_fraction)
+        let (terminal_width, document_width) = if wide {
+            self.document_split.widths(available)
         } else {
-            available
+            self.document_split.stop();
+            (available, available)
         };
         let mut content = div()
             .flex()
@@ -1634,7 +1773,7 @@ impl Render for Browser {
                     ),
             )
             .when(
-                Self::wide(window) && self.document.is_some() && self.terminal.is_some(),
+                Self::wide(window) && self.has_document() && self.terminal.is_some(),
                 |d| {
                     d.child(
                         button("browser-split-toggle", "Side by side", wide).on_click(cx.listener(
@@ -1648,9 +1787,7 @@ impl Render for Browser {
             );
         if wide {
             let terminal = self.terminal_panel(cx);
-            let document = self.document_panel(document_width, cx);
-            let width = (f32::from(window.viewport_size().width) - SIDEBAR_WIDTH - 5.)
-                * self.split_fraction;
+            let document = self.document_panel(document_width, self.document_split.dragging(), cx);
             content = content.child(
                 div()
                     .flex()
@@ -1661,28 +1798,27 @@ impl Render for Browser {
                         div()
                             .flex()
                             .min_h_0()
-                            .w(px(width))
+                            .w(px(terminal_width))
                             .flex_none()
                             .child(terminal),
                     )
-                    .child(
-                        div()
-                            .id("browser-split-divider")
-                            .w(px(5.))
-                            .flex_none()
-                            .cursor_col_resize()
-                            .bg(rgb(0x354055))
-                            .on_mouse_down(
-                                gpui::MouseButton::Left,
-                                cx.listener(|this, _, _, _| {
-                                    this.dragging_split = true;
-                                }),
-                            ),
-                    )
+                    .child(DocumentSplit::divider().on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                            this.document_split
+                                .start(f32::from(event.position.x), available);
+                            this.hide_native_document(cx);
+                            cx.notify();
+                        }),
+                    ))
                     .child(document),
             );
         } else if self.active == Content::Document {
-            content = content.child(self.document_panel(document_width, cx));
+            content = content.child(self.document_panel(
+                document_width,
+                self.document_split.dragging(),
+                cx,
+            ));
         } else {
             self.hide_native_document(cx);
             content = content.child(self.terminal_panel(cx));
@@ -1692,27 +1828,18 @@ impl Render for Browser {
             .size_full()
             .text_color(rgb(0x1c2327))
             .on_mouse_move(
-                cx.listener(|this, event: &gpui::MouseMoveEvent, window, cx| {
-                    if !this.dragging_split {
-                        return;
-                    }
-                    if event.pressed_button != Some(gpui::MouseButton::Left) {
-                        this.dragging_split = false;
-                        return;
-                    }
-                    let available = f32::from(window.viewport_size().width) - SIDEBAR_WIDTH;
-                    if available > 0. {
-                        this.split_fraction = ((f32::from(event.position.x) - SIDEBAR_WIDTH)
-                            / available)
-                            .clamp(0.34, 0.66);
+                cx.listener(move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                    if this.document_split.mouse_move(event, available) {
                         cx.notify();
                     }
                 }),
             )
             .on_mouse_up(
                 gpui::MouseButton::Left,
-                cx.listener(|this, _, _, _| {
-                    this.dragging_split = false;
+                cx.listener(|this, _, _, cx| {
+                    if this.document_split.stop() {
+                        cx.notify();
+                    }
                 }),
             )
             // Leave the PTY's plain Tab and Shift+Tab handling intact.
@@ -1781,6 +1908,22 @@ mod tests {
         assert!(!listings.contains_key(&Some(removed)));
     }
 
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn drive_and_bus_preserve_html_for_native_preview() {
+        let html = b"<title>Document</title><p id='counter'>0</p>";
+        let uri = "remuda:///pilot/example.html";
+        let request = DocumentRequest {
+            id: "example".into(),
+            uri: uri.into(),
+        };
+        for source in [None, Some(request)] {
+            let result = read(|_| Ok(html.to_vec()), uri.into(), source.clone()).unwrap();
+            assert_eq!(result.html.as_deref(), Some(html.as_slice()));
+            assert_eq!(result.request, source);
+        }
+    }
+
     #[gpui::test]
     #[ignore = "launched by the isolated two-listener document acceptance"]
     fn daemonless_receipt_acceptance(cx: &mut gpui::TestAppContext) {
@@ -1801,14 +1944,12 @@ mod tests {
     }
 
     fn document(request: Option<DocumentRequest>) -> Document {
-        Document {
-            uri: "remuda:///pilot/plan.md".into(),
-            media: browser_media::decode("pilot/plan.md", b"# Design plan\n\nMake it readable.")
-                .unwrap(),
+        read(
+            |_| Ok(b"# Design plan\n\nMake it readable.".to_vec()),
+            "remuda:///pilot/plan.md".into(),
             request,
-            #[cfg(any(target_os = "macos", windows))]
-            html: None,
-        }
+        )
+        .unwrap()
     }
 
     #[gpui::test]
@@ -1825,9 +1966,8 @@ mod tests {
                 embedded: false,
                 documents,
                 displayed,
-                document: None,
-                pending_presentation: None,
-                painted: Default::default(),
+                document_tabs: Vec::new(),
+                document_index: 0,
                 active: Content::Terminal,
                 show_drive: false,
                 drive: Some(Drive {
@@ -1843,14 +1983,11 @@ mod tests {
                 }),
                 assets: None,
                 #[cfg(any(target_os = "macos", windows))]
-                native_html: NativeHtml::default(),
+                native_source: None,
                 document_generation: 0,
-                document_scroll: Default::default(),
                 drive_scroll: Default::default(),
-                zoom: 1.,
                 last_input: None,
-                split_fraction: 0.5,
-                dragging_split: false,
+                document_split: Default::default(),
                 terminal: None,
                 screen: Screen::default(),
                 terminal_scroll: Default::default(),
@@ -1908,11 +2045,21 @@ mod tests {
             browser.last_input = Some(Instant::now());
             browser.tick(window, cx);
             assert!(browser.active == Content::Terminal);
-            assert_eq!(browser.pending_presentation, Some(request.clone()));
-            browser.acknowledge_document(browser.document_generation.wrapping_sub(1));
-            browser.pending_presentation.as_mut().unwrap().uri = "remuda:///old".into();
-            browser.acknowledge_document(browser.document_generation);
-            browser.pending_presentation = Some(request.clone());
+            let tab = browser.document_tab().unwrap();
+            assert_eq!(tab.pending_presentation, Some(request.clone()));
+            let generation = tab.generation;
+            let painted = tab.painted.clone();
+            browser.acknowledge_document(generation.wrapping_sub(1), &painted);
+            browser.acknowledge_document(generation, &Rc::new(Cell::new(false)));
+            browser
+                .document_tab_mut()
+                .unwrap()
+                .pending_presentation
+                .as_mut()
+                .unwrap()
+                .uri = "remuda:///old".into();
+            browser.acknowledge_document(generation, &painted);
+            browser.document_tab_mut().unwrap().pending_presentation = Some(request.clone());
         });
         assert!(
             receipt.try_recv().is_err(),
@@ -1940,7 +2087,8 @@ mod tests {
                 .unwrap();
             browser.tick(window, cx);
             assert!(browser.active == Content::Document);
-            assert_eq!(browser.document.as_ref().unwrap().uri, request.uri);
+            assert_eq!(browser.document_tab().unwrap().document.uri, request.uri);
+            assert_eq!(browser.document_tabs.len(), 1);
         });
         assert!(cx.debug_bounds("browser-document-body").is_some());
         assert_eq!(receipt.try_recv().ok(), Some(request.clone()));
@@ -1960,25 +2108,26 @@ mod tests {
         cx.simulate_resize(gpui::size(px(1420.), px(720.)));
         view.update_in(cx, |browser, window, cx| {
             assert!(Browser::wide(window));
-            assert_eq!(browser.document.as_ref().unwrap().uri, request.uri);
+            assert_eq!(browser.document_tab().unwrap().document.uri, request.uri);
             cx.notify();
         });
-        let document = cx.debug_bounds("browser-document-body").unwrap();
-        assert!(document.size.width > px(1000.), "{document:?}");
+        let document_bounds = cx.debug_bounds("browser-document-body").unwrap();
+        assert!(
+            document_bounds.size.width > px(1000.),
+            "{document_bounds:?}"
+        );
 
         view.update_in(cx, |browser, window, cx| {
             let markdown = (0..90)
                 .map(|line| format!("Paragraph {line}\n\n"))
                 .collect::<String>();
-            let media = browser_media::decode("pilot/long.md", markdown.as_bytes()).unwrap();
             browser.open_document(
-                Document {
-                    uri: "remuda:///pilot/long.md".into(),
-                    media,
-                    request: None,
-                    #[cfg(any(target_os = "macos", windows))]
-                    html: None,
-                },
+                read(
+                    |_| Ok(markdown.into_bytes()),
+                    "remuda:///pilot/long.md".into(),
+                    None,
+                )
+                .unwrap(),
                 true,
                 window,
                 cx,
@@ -1993,7 +2142,7 @@ mod tests {
             touch_phase: gpui::TouchPhase::Moved,
             source: gpui::ScrollSource::Pointer,
         });
-        assert!(cx.read(|app| view.read(app).document_scroll.offset().y < px(0.)));
+        assert!(cx.read(|app| view.read(app).document_tab().unwrap().scroll.offset().y < px(0.)));
 
         let folder = "remuda:///pilot/sub".to_owned();
         view.update_in(cx, |browser, window, cx| {
@@ -2076,13 +2225,12 @@ mod tests {
         image.write_to(&mut png, image::ImageFormat::Png).unwrap();
         view.update_in(cx, |browser, window, cx| {
             browser.open_document(
-                Document {
-                    uri: "remuda:///pilot/image.png".into(),
-                    media: browser_media::decode("pilot/image.png", png.get_ref()).unwrap(),
-                    request: None,
-                    #[cfg(any(target_os = "macos", windows))]
-                    html: None,
-                },
+                read(
+                    |_| Ok(png.into_inner()),
+                    "remuda:///pilot/image.png".into(),
+                    None,
+                )
+                .unwrap(),
                 true,
                 window,
                 cx,
@@ -2092,25 +2240,77 @@ mod tests {
         });
         let zoom = cx.debug_bounds("zoom-in").unwrap();
         cx.simulate_click(zoom.center(), gpui::Modifiers::none());
-        assert_eq!(view.read_with(cx, |browser, _| browser.zoom), 1.25);
-        view.update_in(cx, |browser, window, _| {
-            assert!(browser.document_focus.is_focused(window))
-        });
-        cx.simulate_keystrokes("tab tab space");
-        cx.simulate_event(gpui::KeyUpEvent {
-            keystroke: gpui::Keystroke::parse("space").unwrap(),
-        });
-        assert_eq!(view.read_with(cx, |browser, _| browser.zoom), 1.);
+        assert_eq!(
+            view.read_with(cx, |browser, _| browser.document_tab().unwrap().zoom),
+            1.25
+        );
+        let first = cx.debug_bounds("document-tab-1").unwrap();
+        let third = cx.debug_bounds("document-tab-3").unwrap();
+        cx.simulate_click(first.center(), gpui::Modifiers::none());
+        assert_eq!(
+            view.read_with(cx, |browser, _| browser
+                .document_tab()
+                .unwrap()
+                .document
+                .uri
+                .clone()),
+            request.uri
+        );
+        cx.simulate_click(third.center(), gpui::Modifiers::none());
+        assert_eq!(
+            view.read_with(cx, |browser, _| browser.document_tab().unwrap().zoom),
+            1.25
+        );
+        let fit = cx.debug_bounds("zoom-fit").unwrap();
+        cx.simulate_click(fit.center(), gpui::Modifiers::none());
+        assert_eq!(
+            view.read_with(cx, |browser, _| browser.document_tab().unwrap().zoom),
+            1.
+        );
         view.update_in(cx, |browser, window, cx| {
             assert!(browser.owns_document_focus(window, cx))
         });
-        cx.simulate_keystrokes("tab enter");
-        cx.simulate_event(gpui::KeyUpEvent {
-            keystroke: gpui::Keystroke::parse("enter").unwrap(),
-        });
+
+        let close = cx.debug_bounds("close-document").unwrap();
+        cx.simulate_click(close.center(), gpui::Modifiers::none());
+        assert!(cx.debug_bounds("browser-document-body").is_some());
+        assert!(view.read_with(cx, |browser, _| {
+            let tab = browser.document_tab().unwrap();
+            browser.document_tabs.len() == 2 && tab.scroll.offset().y < px(0.)
+        }));
+        for _ in 0..2 {
+            let close = cx.debug_bounds("close-document").unwrap();
+            cx.simulate_click(close.center(), gpui::Modifiers::none());
+        }
         assert!(cx.debug_bounds("browser-document-body").is_none());
         view.update_in(cx, |browser, window, _| {
             assert!(browser.focus.is_focused(window))
         });
+
+        let update = DocumentRequest {
+            id: "updated-plan".into(),
+            uri: request.uri.clone(),
+        };
+        view.update_in(cx, |browser, window, cx| {
+            browser.open_document(document(None), true, window, cx);
+            let first = browser.document_tab().unwrap();
+            let generation = first.generation;
+            let painted = first.painted.clone();
+            let refreshed = read(
+                |_| Ok(b"# Revised plan\n\nNew content.".to_vec()),
+                update.uri.clone(),
+                Some(update.clone()),
+            )
+            .unwrap();
+            browser.open_document(refreshed, true, window, cx);
+            browser.acknowledge_document(generation, &painted);
+            assert!(receipt.try_recv().is_err());
+            assert_eq!(browser.document_tabs.len(), 1);
+            let current = browser.document_tab().unwrap();
+            assert_ne!(current.generation, generation);
+            assert_eq!(current.document.media.title, "Revised plan");
+            cx.notify();
+        });
+        assert_eq!(receipt.try_recv().ok(), Some(update));
     }
 }

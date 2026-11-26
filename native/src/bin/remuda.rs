@@ -182,6 +182,15 @@ fn run_cli(args: Vec<String>) -> ExitCode {
     if argv.first() == Some(&"browser") {
         return browser::run(&argv[1..], server, stdin_enabled);
     }
+    if argv.first() == Some(&"_browser-workspace") {
+        if stdin_enabled || argv.len() != 1 {
+            return fail("invalid browser workspace arguments");
+        }
+        return match remuda_native::remote_front::serve_workspace(&daemon::socket_path(server)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(format!("browser workspace: {error}")),
+        };
+    }
     if argv.first() == Some(&"tray") {
         if stdin_enabled || server != "default" {
             return fail("remuda tray uses the default daemon and does not accept --stdin");

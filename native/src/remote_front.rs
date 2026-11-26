@@ -146,6 +146,84 @@ fn forward_request_with_timeout(
     serde_json::to_vec(&response).map_err(|error| error.to_string())
 }
 
+/// Fixed remote command and greeting for an already authenticated SSH stream.
+pub const WORKSPACE_COMMAND: &str = "remuda _browser-workspace";
+pub const WORKSPACE_HELLO: &[u8] = b"remuda-browser-workspace-v1\n";
+pub const MAX_WORKSPACE_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// Serve the workspace on inherited stdio. The SSH login authorizes access to
+/// this account's daemon; this entry point does not listen on any address.
+pub fn serve_workspace(daemon_path: &Path) -> std::io::Result<()> {
+    let mut input = std::io::stdin().lock();
+    let mut output = std::io::stdout().lock();
+    serve_workspace_stream(&mut input, &mut output, |request| {
+        if matches!(request, Request::ResizeSession { .. }) {
+            match crate::cluster::control::enabled() {
+                Ok(true) => (),
+                Ok(false) => {
+                    return serde_json::to_vec(
+                        &remuda_core::protocol::Response::RemoteControlDisabled,
+                    )
+                    .map_err(|_| "workspace response encode failed")
+                }
+                Err(_) => return Err("remote control setting unavailable"),
+            }
+        }
+        let timeout = request_timeout(&request);
+        let request = peer_input_request(request);
+        forward_request_with_timeout(daemon_path, &request, timeout)
+            .map_err(|_| "local daemon request failed")
+    })
+}
+
+fn serve_workspace_stream(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    mut dispatch: impl FnMut(Request) -> Result<Vec<u8>, &'static str>,
+) -> std::io::Result<()> {
+    use remuda_core::protocol::Response;
+
+    output.write_all(WORKSPACE_HELLO)?;
+    output.flush()?;
+    let mut frame = Vec::new();
+    loop {
+        frame.clear();
+        (&mut *input)
+            .take((MAX_FRAME_BYTES + 1) as u64)
+            .read_until(b'\n', &mut frame)?;
+        if frame.is_empty() {
+            return Ok(());
+        }
+        if frame.pop() != Some(b'\n') {
+            // Stop without interpreting a truncated or oversized request.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid workspace frame length",
+            ));
+        }
+        let response = decode_frame(&frame).and_then(|request| match request {
+            Request::List
+            | Request::RenderedSessionList { .. }
+            | Request::CaptureStyled {
+                scrollback: 0..=10_000,
+                ..
+            }
+            | Request::ResizeSession { .. }
+            | Request::Input { .. }
+            | Request::RemoteInputLine { .. } => dispatch(request).map_err(str::to_owned),
+            _ => Err("request is not available to the workspace".into()),
+        });
+        let reply = match response {
+            Ok(reply) if reply.len() <= MAX_WORKSPACE_RESPONSE_BYTES => reply,
+            Ok(_) => serde_json::to_vec(&Response::error("workspace response is too large"))?,
+            Err(reason) => serde_json::to_vec(&Response::error(reason))?,
+        };
+        output.write_all(&reply)?;
+        output.write_all(b"\n")?;
+        output.flush()?;
+    }
+}
+
 /// Serve one request per connection on a local socket. This listener is not
 /// network facing; a later authenticated transport can call `forward_frame`.
 pub fn serve_local(path: &Path, daemon_path: &Path) -> std::io::Result<()> {
@@ -397,6 +475,70 @@ fn refusal(variant: &str) -> String {
 mod tests {
     use super::*;
     use remuda_core::protocol::{Request, Response};
+
+    #[test]
+    fn workspace_protocol_dispatches_only_window_operations() {
+        let requests = [
+            Request::List,
+            Request::Eval {
+                code: "return true".into(),
+                name: None,
+            },
+            Request::Sync {
+                name: "session".into(),
+                instance_id: None,
+                since: 0,
+                timeout_ms: 100,
+            },
+            Request::RenderedSessionList { width: 80 },
+        ];
+        let mut input = Vec::new();
+        for request in requests {
+            serde_json::to_writer(&mut input, &request).unwrap();
+            input.push(b'\n');
+        }
+        let mut seen = Vec::new();
+        let mut output = Vec::new();
+        serve_workspace_stream(&mut input.as_slice(), &mut output, |request| {
+            seen.push(request);
+            Ok(serde_json::to_vec(&Response::Ok).unwrap())
+        })
+        .unwrap();
+        assert!(matches!(
+            &seen[..],
+            [Request::List, Request::RenderedSessionList { width: 80 }]
+        ));
+        let responses: Vec<Response> = output
+            .strip_prefix(WORKSPACE_HELLO)
+            .unwrap()
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert!(matches!(
+            &responses[..],
+            [
+                Response::Ok,
+                Response::Error(_),
+                Response::Error(_),
+                Response::Ok
+            ]
+        ));
+    }
+
+    #[test]
+    fn workspace_protocol_fails_closed_on_truncated_or_oversized_request() {
+        let too_large = vec![b' '; MAX_FRAME_BYTES + 2];
+        for mut input in [&b"\"List\""[..], &too_large] {
+            let mut output = Vec::new();
+            let error = serve_workspace_stream(&mut input, &mut output, |_| {
+                panic!("an incomplete frame must never dispatch");
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(output, WORKSPACE_HELLO);
+        }
+    }
 
     #[allow(dead_code)]
     #[derive(serde::Deserialize)]

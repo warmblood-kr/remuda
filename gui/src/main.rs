@@ -14,6 +14,7 @@ mod browser;
 mod browser_media;
 mod clipboard_image;
 mod cluster_status;
+mod document_split;
 #[allow(dead_code)]
 mod input_helper;
 mod line_input;
@@ -29,6 +30,8 @@ use terminal_view::Screen;
 mod macos_icon;
 mod provider;
 mod session_tree;
+mod ssh_workspace;
+use ssh_workspace::SshWorkspace;
 #[cfg(any(target_os = "macos", windows))]
 mod tray;
 #[cfg(windows)]
@@ -382,6 +385,7 @@ struct PeerSessions {
 }
 
 struct LocalGui {
+    ssh: Option<SshWorkspace>,
     tree_focus: Option<gpui::FocusHandle>,
     tree_scroll: gpui::ScrollHandle,
     search: Option<String>,
@@ -389,6 +393,7 @@ struct LocalGui {
     show_help: bool,
     sidebar_width: f32,
     resize_start: Option<(f32, f32)>,
+    document_split: document_split::DocumentSplit,
     node_status: Option<cluster_status::ClusterStatus>,
     selected_node_status: NodeMetricsStatus,
     node_details_requested: bool,
@@ -456,6 +461,7 @@ impl LocalGui {
         let (nodes_sender, nodes_results) = mpsc::channel();
         let (remote_sender, remote_results) = mpsc::channel();
         Self {
+            ssh: None,
             tree_focus: None,
             tree_scroll: gpui::ScrollHandle::new(),
             search: None,
@@ -463,6 +469,7 @@ impl LocalGui {
             show_help: false,
             sidebar_width: 266.,
             resize_start: None,
+            document_split: Default::default(),
             node_status: None,
             selected_node_status: NodeMetricsStatus::default(),
             node_details_requested: false,
@@ -636,7 +643,13 @@ impl LocalGui {
             .as_ref()
             .filter(|s| self.selection_current(s))
         {
-            match live_session::LiveSession::new(selection, compose) {
+            let live = match &self.ssh {
+                Some(connection) => {
+                    live_session::LiveSession::ssh(connection.clone(), selection, compose)
+                }
+                None => live_session::LiveSession::new(selection, compose),
+            };
+            match live {
                 Ok(live) => {
                     let history = compose.then(|| {
                         self.line_history
@@ -754,7 +767,7 @@ impl LocalGui {
         use live_session::Submit;
         let Some(live) = &self.live else { return };
         self.live_notice = Some(
-            if self.selection.as_ref().is_some_and(|s| s.peer.is_some()) {
+            if self.ssh.is_some() || self.selection.as_ref().is_some_and(|s| s.peer.is_some()) {
                 "Clipboard images require a session on this device"
             } else {
                 match self.clipboard_images.paste(image, live) {
@@ -973,7 +986,13 @@ impl LocalGui {
         let scroll = self.terminal_scroll.offset.to_string();
         self.preview_busy = true;
         let sender = self.preview_sender.clone();
+        let ssh = self.ssh.clone();
         std::thread::spawn(move || {
+            if let Some(ssh) = ssh {
+                let result = ssh.preview(&selection, resize, &scroll);
+                let _ = sender.send((generation, selection, result));
+                return;
+            }
             let peer = selection.peer.as_deref().unwrap_or("");
             let kind = if selection.peer.is_some() {
                 "peer"
@@ -1010,6 +1029,9 @@ impl LocalGui {
         });
     }
     fn refresh_nodes(&mut self) {
+        if self.ssh.is_some() {
+            return;
+        }
         if self
             .selection
             .as_ref()
@@ -1143,7 +1165,12 @@ impl LocalGui {
         self.pending = false;
         let generation = self.generation;
         let sender = self.sender.clone();
+        let ssh = self.ssh.clone();
         std::thread::spawn(move || {
+            if let Some(ssh) = ssh {
+                let _ = sender.send((generation, ssh.sessions()));
+                return;
+            }
             #[cfg(test)]
             let executable = std::env::var_os("REMUDA_GUI_ACCEPTANCE_WORKER")
                 .map(std::path::PathBuf::from)
@@ -1169,7 +1196,7 @@ impl LocalGui {
     }
 
     fn selected_status_target(&self) -> Option<StatusNode> {
-        if !self.showing_node_details() || self.drive_selected {
+        if self.ssh.is_some() || !self.showing_node_details() || self.drive_selected {
             return None;
         }
         match &self.focused_row {
@@ -1471,7 +1498,21 @@ fn main() {
                 })
                 .detach();
             }
-            browser::open(cx, bounds, destination, browser.flatten());
+            let probe_host = destination.clone();
+            let probe = cx
+                .background_executor()
+                .spawn(async move { SshWorkspace::connect(&probe_host) });
+            cx.spawn(async move |cx| {
+                let probed = probe.await;
+                let _ = cx.update(|cx| match probed {
+                    Ok(connection) => {
+                        open_workspace(cx, bounds, Some((connection, browser.flatten())));
+                        cx.activate(true);
+                    }
+                    Err(_) => browser::open(cx, bounds, destination, browser.flatten()),
+                });
+            })
+            .detach();
             return;
         }
         open_local_window(cx, bounds);
@@ -1540,6 +1581,14 @@ fn show_local_window(window: &std::cell::Cell<Option<gpui::AnyWindowHandle>>, cx
 }
 
 fn open_local_window(cx: &mut App, bounds: Bounds<gpui::Pixels>) -> gpui::AnyWindowHandle {
+    open_workspace(cx, bounds, None)
+}
+
+fn open_workspace(
+    cx: &mut App,
+    bounds: Bounds<gpui::Pixels>,
+    external: Option<(SshWorkspace, Option<remuda_native::net::browser::Client>)>,
+) -> gpui::AnyWindowHandle {
     let window = cx
         .open_window(
             WindowOptions {
@@ -1548,32 +1597,50 @@ fn open_local_window(cx: &mut App, bounds: Bounds<gpui::Pixels>) -> gpui::AnyWin
             },
             |window, cx| {
                 #[cfg(target_os = "macos")]
-                macos_lifecycle::install_window(window, cx, macos_lifecycle::WindowKind::Remuda);
+                macos_lifecycle::install_window(
+                    window,
+                    cx,
+                    if external.is_some() {
+                        macos_lifecycle::WindowKind::Browser
+                    } else {
+                        macos_lifecycle::WindowKind::Remuda
+                    },
+                );
                 #[cfg(windows)]
                 {
-                    window.set_window_title("Remuda");
+                    window.set_window_title(if external.is_some() {
+                        "Remuda Browser"
+                    } else {
+                        "Remuda"
+                    });
                     windows_icon::install(window);
                     windows_input::install(window);
                 }
                 let focus = cx.focus_handle();
                 focus.focus(window, cx);
                 let window = window.window_handle();
-                cx.new(|cx| {
+                cx.new(move |cx| {
                     let mut gui = LocalGui::new();
                     gui.tree_focus = Some(focus);
                     let live_focus = cx.focus_handle();
                     gui.live_focus = Some(live_focus.clone());
-                    let client = match remuda_native::net::browser::Client::from_env() {
-                        Ok(client) => client,
-                        Err(error) => {
-                            eprintln!("Remuda Drive credentials: {error}");
-                            None
-                        }
-                    };
-                    gui.documents =
-                        Some(cx.new(|cx| browser::Browser::local(client, live_focus, cx)));
+                    if let Some((connection, client)) = external {
+                        gui.ssh = Some(connection);
+                        gui.documents =
+                            Some(cx.new(|cx| browser::Browser::ssh(client, live_focus, cx)));
+                    } else {
+                        let client = match remuda_native::net::browser::Client::from_env() {
+                            Ok(client) => client,
+                            Err(error) => {
+                                eprintln!("Remuda Drive credentials: {error}");
+                                None
+                            }
+                        };
+                        gui.documents =
+                            Some(cx.new(|cx| browser::Browser::local(client, live_focus, cx)));
+                        gui.node_status = cluster_status::ClusterStatus::start().ok();
+                    }
 
-                    gui.node_status = cluster_status::ClusterStatus::start().ok();
                     gui.refresh();
                     gui.refresh_nodes();
                     cx.spawn(async move |weak, cx| loop {
@@ -1763,8 +1830,42 @@ mod tests {
         cx.simulate_resize(gpui::size(px(1120.), px(720.)));
         let split = cx.debug_bounds("local-split-tab").unwrap();
         cx.simulate_click(split.center(), gpui::Modifiers::none());
-        assert!(cx.debug_bounds("browser-document-body").is_some());
-        assert!(cx.debug_bounds("session-pane").is_some());
+        let divider = cx.debug_bounds("document-split-divider").unwrap();
+        let document = cx.debug_bounds("browser-document-body").unwrap();
+        let terminal_pane = cx.debug_bounds("session-pane").unwrap();
+        let start = divider.center();
+        let end = gpui::point(start.x - px(80.), start.y);
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Left,
+            position: start,
+            ..Default::default()
+        });
+        cx.simulate_event(gpui::MouseMoveEvent {
+            pressed_button: Some(gpui::MouseButton::Left),
+            position: end,
+            ..Default::default()
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            button: gpui::MouseButton::Left,
+            position: end,
+            ..Default::default()
+        });
+        let resized = cx.debug_bounds("browser-document-body").unwrap();
+        assert_eq!(resized.size.width, document.size.width + px(80.));
+        assert_eq!(
+            cx.debug_bounds("session-pane").unwrap().size.width,
+            terminal_pane.size.width - px(80.)
+        );
+        cx.simulate_event(gpui::MouseMoveEvent {
+            pressed_button: Some(gpui::MouseButton::Left),
+            position: gpui::point(end.x + px(40.), end.y),
+            ..Default::default()
+        });
+        assert_eq!(cx.debug_bounds("browser-document-body").unwrap(), resized);
+        cx.simulate_resize(gpui::size(px(1119.), px(720.)));
+        assert!(cx.debug_bounds("document-split-divider").is_none());
+        cx.simulate_resize(gpui::size(px(1120.), px(720.)));
+        assert_eq!(cx.debug_bounds("browser-document-body").unwrap(), resized);
         let terminal = cx.debug_bounds("local-terminal-tab").unwrap();
         cx.simulate_click(terminal.center(), gpui::Modifiers::none());
         assert!(cx.debug_bounds("browser-document-body").is_none());

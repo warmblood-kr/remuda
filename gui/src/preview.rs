@@ -2,7 +2,7 @@ use crate::{discover_peers, peer_is_unique, worker_deadline, Selection};
 use remuda_native::session_preview::{capture, IdentityPolicy, PreviewFrame};
 use std::time::{Duration, Instant};
 
-fn styled(frame: PreviewFrame) -> Result<crate::terminal_view::Screen, String> {
+pub(crate) fn styled(frame: PreviewFrame) -> Result<crate::terminal_view::Screen, String> {
     let mut screen = crate::terminal_view::Screen::from_cells(frame.cells)?;
     screen.scrollback_len = frame.scrollback_len;
     screen.wrapped = frame.wrapped;

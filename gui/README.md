@@ -3,9 +3,12 @@
 On Apple silicon macOS and x64 Windows, the [nightly installer](../README.md#install-the-browser-nightly)
 installs the CLI and the matching native GUI together. Run
 `remuda browser --gui HOST` with an SSH host or alias for a machine running Remuda.
-The native Browser opens the remote Remuda terminal and can receive
-[VFS document-open requests](../README.md#open-a-vfs-document-for-a-browser-reader)
-in the same window. Browser mode does not need a local daemon or cluster membership.
+The native Browser opens the shared Remuda workspace with the SSH host's
+sessions and can receive
+[VFS document-open requests](../README.md#open-a-vfs-document-for-a-browser-reader).
+Browser mode does not need a local daemon or cluster membership. Hosts with
+older Remuda versions and SSH logins that need an interactive prompt use the
+terminal-based connection.
 
 ## Local session prototype
 
@@ -40,24 +43,24 @@ tree. Offline peers retain their last known screen and show its age.
 
 ## Browser Drive and document opens
 
-The **Open Remuda** window also has **Sessions** and **Drive** in its sidebar.
-It uses the same document pane and presentation receipts as Browser.
-Without a Browser credential, its Drive uses the local account’s VFS access.
-With a credential, Drive and document delivery use that configured route.
+**Open Remuda** and **Open Browser** have **Sessions** and **Drive** in their
+sidebar. Open Remuda uses the local account’s VFS access without a Browser
+credential. Open Browser needs a Browser credential for Drive and document
+delivery. The SSH connection supplies the authenticated host’s sessions, and
+the Browser credential supplies the configured document route.
 
-`remuda browser --gui HOST` keeps the remote terminal connected over SSH.
-Choose **Drive** in the sidebar to browse authorized folders and open a file.
-The session navigation supplied by the remote terminal stays available in the
-**Sessions** workspace. A wide window shows the terminal and reader next to
-each other. A narrow window uses **Terminal** and **Document** tabs. An incoming
-document can open beside terminal input. In narrow mode, recent terminal input
-keeps the terminal selected and marks the document tab.
+Use **Side by side** in a wide window and drag the boundary to resize the
+terminal and document. A narrow window uses **Terminal** and **Document** tabs.
+An incoming document can open beside terminal input. In narrow mode, recent
+terminal input keeps the terminal selected and marks the document tab.
 
-The reader supports Markdown, static HTML, PNG, JPEG, GIF (first frame), and WebP.
-VFS links and embedded images use the same read authorization as Drive.
-HTML is rendered as read-only content. Large images fit the pane first and can
-be zoomed and scrolled. Closing or replacing a document releases its rendered
-resources.
+Drive and Butler requests open documents in the same tab list. Opening the
+same URI selects its existing tab. Closing the active tab releases its
+resources and selects a neighboring tab when one remains. Markdown, PNG,
+JPEG, GIF (first frame), and WebP use the reader. HTML uses native WebView by
+default on macOS and Windows, including self-contained CSS and JavaScript.
+Select **Reader** for the static view. Relative resources use the document's
+VFS read authorization. Large images in the reader can be zoomed and scrolled.
 
 ### Provisioning the Browser route
 
