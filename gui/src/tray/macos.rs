@@ -2,7 +2,7 @@ use objc2::{
     define_class, msg_send, rc::Retained, runtime::AnyObject, sel, DefinedClass, MainThreadOnly,
 };
 use objc2_app_kit::{
-    NSAlert, NSApplication, NSApplicationActivationPolicy, NSMenu, NSStatusBar,
+    NSAlert, NSAlertStyle, NSApplication, NSApplicationActivationPolicy, NSMenu, NSStatusBar,
     NSVariableStatusItemLength,
 };
 use objc2_foundation::{ns_string, MainThreadMarker, NSObject};
@@ -25,6 +25,11 @@ define_class!(
         #[unsafe(method(openRemudaBrowser:))]
         fn open_browser(&self, _sender: &AnyObject) {
             super::open_browser();
+        }
+
+        #[unsafe(method(aboutRemuda:))]
+        fn about(&self, _sender: &AnyObject) {
+            super::about();
         }
 
         #[unsafe(method(upgradeRemuda:))]
@@ -79,6 +84,12 @@ pub(super) fn run() -> io::Result<super::Action> {
             ns_string!(""),
         );
         upgrade.setTarget(Some(&target));
+        let about = menu.addItemWithTitle_action_keyEquivalent(
+            ns_string!("About Remuda"),
+            Some(sel!(aboutRemuda:)),
+            ns_string!(""),
+        );
+        about.setTarget(Some(&target));
         let quit = menu.addItemWithTitle_action_keyEquivalent(
             ns_string!("Quit Tray"),
             Some(sel!(quitRemudaTray:)),
@@ -102,10 +113,13 @@ pub(super) fn run() -> io::Result<super::Action> {
     Ok(target.ivars().get())
 }
 
-pub(super) fn upgrade_error(message: &str) {
+pub(super) fn show_dialog(title: &str, message: &str, warning: bool) {
     if let Some(mtm) = MainThreadMarker::new() {
         let alert = NSAlert::new(mtm);
-        alert.setMessageText(ns_string!("Remuda upgrade needs attention"));
+        alert.setMessageText(&objc2_foundation::NSString::from_str(title));
+        if warning {
+            alert.setAlertStyle(NSAlertStyle::Warning);
+        }
         alert.setInformativeText(&objc2_foundation::NSString::from_str(message));
         alert.runModal();
     }

@@ -16,9 +16,9 @@ use windows_sys::{
                 AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
                 DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW, MessageBoxW,
                 PostMessageW, RegisterClassW, SetForegroundWindow, TrackPopupMenu,
-                UnregisterClassW, IDI_APPLICATION, MB_ICONWARNING, MB_OK, MF_STRING, MSG,
-                TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP, WM_NULL,
-                WM_RBUTTONUP, WNDCLASSW,
+                UnregisterClassW, IDI_APPLICATION, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK,
+                MF_STRING, MSG, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU,
+                WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WNDCLASSW,
             },
         },
     },
@@ -30,6 +30,7 @@ const OPEN_REMUDA: usize = 1;
 const QUIT_TRAY: usize = 2;
 const OPEN_BROWSER: usize = 3;
 const UPGRADE_REMUDA: usize = 4;
+const ABOUT_REMUDA: usize = 5;
 
 pub(super) fn run() -> io::Result<super::Action> {
     // SAFETY: Use a process-owned class and hidden window on this thread. The
@@ -122,6 +123,7 @@ fn run_message_loop(window: HWND) -> io::Result<super::Action> {
                     match message.wParam {
                         OPEN_REMUDA => super::open_remuda(),
                         OPEN_BROWSER => super::open_browser(),
+                        ABOUT_REMUDA => super::about(),
                         QUIT_TRAY => return Ok(super::Action::Quit),
                         UPGRADE_REMUDA => return Ok(super::Action::Upgrade),
                         _ => {}
@@ -164,6 +166,7 @@ unsafe fn show_menu(window: HWND) {
         if AppendMenuW(menu, MF_STRING, OPEN_REMUDA, w!("Open Remuda")) != 0
             && AppendMenuW(menu, MF_STRING, OPEN_BROWSER, w!("Open Browser…")) != 0
             && AppendMenuW(menu, MF_STRING, UPGRADE_REMUDA, w!("Upgrade Remuda")) != 0
+            && AppendMenuW(menu, MF_STRING, ABOUT_REMUDA, w!("About Remuda")) != 0
             && AppendMenuW(menu, MF_STRING, QUIT_TRAY, w!("Quit Tray")) != 0
             && GetCursorPos(&mut cursor) != 0
         {
@@ -187,15 +190,16 @@ unsafe fn show_menu(window: HWND) {
     }
 }
 
-pub(super) fn upgrade_error(message: &str) {
+pub(super) fn show_dialog(title: &str, message: &str, warning: bool) {
+    let title: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+    let icon = if warning {
+        MB_ICONWARNING
+    } else {
+        MB_ICONINFORMATION
+    };
     let text: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
     // SAFETY: The UTF-16 text remains valid until the modal dialog returns.
     unsafe {
-        MessageBoxW(
-            null_mut(),
-            text.as_ptr(),
-            w!("Remuda upgrade needs attention"),
-            MB_OK | MB_ICONWARNING,
-        );
+        MessageBoxW(null_mut(), text.as_ptr(), title.as_ptr(), MB_OK | icon);
     }
 }

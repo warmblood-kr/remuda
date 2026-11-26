@@ -133,11 +133,55 @@ fn restart_tray(cli: &Path) -> Result<(), String> {
     }
 }
 
+fn about() {
+    use remuda_core::protocol::{Request, Response};
+    use remuda_native::{client, daemon, dist};
+
+    let cli = installed_cli().ok().and_then(|path| {
+        let output = cli_command(&path, &["--version"]).output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let line = String::from_utf8(output.stdout).ok()?;
+        line.lines()
+            .next()?
+            .strip_prefix("remuda ")
+            .map(str::to_owned)
+    });
+    let daemon = match client::request_with_timeout(
+        &daemon::socket_path("default"),
+        &Request::Version,
+        std::time::Duration::from_secs(1),
+    ) {
+        Ok(Response::Value(build)) => build,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => "Not running".into(),
+        _ => "Unavailable".into(),
+    };
+    let mut details = format!(
+        "Running tray (GUI): {}\nInstalled CLI: {}\nRunning daemon (default): {}\nUpdate channel: {}",
+        dist::BUILD_VERSION,
+        cli.as_deref().unwrap_or("Unavailable"),
+        daemon,
+        dist::channel()
+    );
+    if cli
+        .as_deref()
+        .is_some_and(|build| build != dist::BUILD_VERSION)
+    {
+        details.push_str("\n\nThe tray and CLI builds differ.");
+    }
+    show_dialog("About Remuda", &details, false);
+}
+
 fn report_upgrade_error(message: &str) {
+    show_dialog("Remuda upgrade needs attention", message, true);
+}
+
+fn show_dialog(title: &str, message: &str, warning: bool) {
     #[cfg(target_os = "macos")]
-    macos::upgrade_error(message);
+    macos::show_dialog(title, message, warning);
     #[cfg(windows)]
-    windows::upgrade_error(message);
+    windows::show_dialog(title, message, warning);
 }
 
 #[cfg(target_os = "macos")]
