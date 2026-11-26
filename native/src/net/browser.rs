@@ -22,8 +22,16 @@ pub use drive::{
     list_local_drive, read_local_drive, DriveChunk, DriveEntry, DriveListing, DriveReadError,
 };
 
+const SOURCE_ENVELOPE: &[u8] = b"remuda-browser-source-v1\n";
 const ENVELOPE: &[u8] = b"remuda-browser-v1\n";
 const MAX_DOCUMENT_BYTES: u64 = 64 * 1024;
+
+#[derive(Serialize, Deserialize)]
+struct SourceRequest<'a> {
+    uri: &'a str,
+    offset: u64,
+    revision: Option<&'a str>,
+}
 
 #[derive(Serialize, Deserialize)]
 pub enum Operation {
@@ -49,6 +57,11 @@ pub enum Operation {
         after: String,
     },
     ReadChunk {
+        uri: String,
+        offset: u64,
+        revision: Option<String>,
+    },
+    ReadSource {
         uri: String,
         offset: u64,
         revision: Option<String>,
@@ -154,6 +167,9 @@ impl Service {
     }
 
     pub(super) fn authenticates(&self, payload: &[u8], peer: &[u8], admitted: bool) -> bool {
+        if payload.starts_with(SOURCE_ENVELOPE) {
+            return admitted && self.drive.cluster_source_enabled();
+        }
         payload.starts_with(ENVELOPE)
             && if admitted {
                 self.relay_publisher.as_deref() == Some(peer)
@@ -166,10 +182,21 @@ impl Service {
         if !self.authenticates(payload, peer, admitted) {
             return None;
         }
-        let payload = payload.strip_prefix(ENVELOPE)?;
-        let reply = match serde_json::from_slice(payload) {
-            Ok(operation) => self.handle(operation, peer, admitted),
-            Err(_) => Reply::Invalid,
+        let reply = if let Some(payload) = payload.strip_prefix(SOURCE_ENVELOPE) {
+            match serde_json::from_slice::<SourceRequest<'_>>(payload) {
+                Ok(request) => read_reply(
+                    self.drive
+                        .read_source(request.uri, request.offset, request.revision, true)
+                        .map(Reply::Chunk),
+                ),
+                Err(_) => Reply::Invalid,
+            }
+        } else {
+            let payload = payload.strip_prefix(ENVELOPE)?;
+            match serde_json::from_slice(payload) {
+                Ok(operation) => self.handle(operation, peer, admitted),
+                Err(_) => Reply::Invalid,
+            }
         };
         let bytes = serde_json::to_vec(&reply).ok()?;
         if bytes.len() > super::frame::MAX_RESPONSE_PAYLOAD {
@@ -206,6 +233,17 @@ impl Service {
             };
         }
         match &operation {
+            Operation::ReadSource {
+                uri,
+                offset,
+                revision,
+            } => {
+                return self.browser_operation(peer, || {
+                    self.drive
+                        .read_source(uri, *offset, revision.as_deref(), false)
+                        .map(Reply::Chunk)
+                });
+            }
             Operation::List { directory } => {
                 return self.browser_operation(peer, || {
                     self.drive
@@ -279,12 +317,7 @@ impl Service {
         if peer != self.browser {
             return Reply::Denied;
         }
-        match work() {
-            Ok(reply) => reply,
-            Err(DriveReadError::Denied) => Reply::Denied,
-            Err(DriveReadError::Changed) => Reply::DocumentChanged,
-            Err(_) => Reply::ReadFailed,
-        }
+        read_reply(work())
     }
 }
 
@@ -316,6 +349,49 @@ fn relay(target: &str, request: DocumentRequest) -> Reply {
         Ok(reply @ (Reply::Outcome(_) | Reply::Denied)) => reply,
         _ => Reply::Outcome(Outcome::Unknown),
     }
+}
+
+fn read_reply(result: Result<Reply, DriveReadError>) -> Reply {
+    match result {
+        Ok(reply) => reply,
+        Err(DriveReadError::Denied) => Reply::Denied,
+        Err(DriveReadError::Changed) => Reply::DocumentChanged,
+        Err(_) => Reply::ReadFailed,
+    }
+}
+
+/// Read only the exact source file explicitly shared with the admitted cluster.
+pub fn read_cluster_source(fingerprint: &str, uri: &str) -> Result<Vec<u8>, DriveReadError> {
+    use crate::cluster_api::{resolve_call, ResolvedCall};
+    let ResolvedCall::Remote {
+        fingerprint: peer,
+        address,
+        pinned_static_key,
+    } = resolve_call(fingerprint, None).map_err(|_| DriveReadError::Denied)?
+    else {
+        return Err(DriveReadError::Denied);
+    };
+    if peer != fingerprint {
+        return Err(DriveReadError::Denied);
+    }
+    let private =
+        crate::cluster::identity::load_static_private_key().map_err(|_| DriveReadError::Denied)?;
+    let client = ClusterClient::system().with_request_timeout(Duration::from_secs(3));
+    drive::transfer_cluster_source(|offset, revision| {
+        let mut payload = SOURCE_ENVELOPE.to_vec();
+        serde_json::to_writer(
+            &mut payload,
+            &SourceRequest {
+                uri,
+                offset,
+                revision,
+            },
+        )
+        .map_err(|_| ClientError::BadResponse)?;
+        let reply =
+            client.request_payload(address, &pinned_static_key, &private, &payload, false)?;
+        serde_json::from_slice(&reply).map_err(|_| ClientError::BadResponse)
+    })
 }
 
 fn read_document(uri: &str) -> Option<String> {
@@ -371,6 +447,20 @@ impl Client {
             endpoint: config.endpoint,
             server: key(&config.server)?,
             private: Zeroizing::new(key(&private)?),
+        })
+    }
+
+    /// Read the configured file through the designated Browser credential.
+    pub fn read_source(&self, source: &str, uri: &str) -> Result<Vec<u8>, DriveReadError> {
+        if encoding::fingerprint(&self.server) != source {
+            return Err(DriveReadError::Denied);
+        }
+        drive::transfer_cluster_source(|offset, revision| {
+            self.send(&Operation::ReadSource {
+                uri: uri.to_owned(),
+                offset,
+                revision: revision.map(str::to_owned),
+            })
         })
     }
 

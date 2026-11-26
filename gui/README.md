@@ -89,6 +89,19 @@ in-place changes, and accepts files up to 1 MiB. Reload the listener policy
 after replacing the file or to revoke its alias. Use an absolute path in a
 directory controlled by the listener operator.
 
+An explicit terminal OSC 8 `file://` link can open in the document reader
+from an Open Remuda session. For a peer session, the source listener must
+grant that exact file with `"allow_cluster_read": true` inside its
+`source_file` policy entry. This shares that one file with admitted cluster
+nodes. The viewer pins the session's source node and reads through its listener.
+The local file on the viewer remains separate from the source node's file.
+Plain terminal paths have no link metadata. In the cluster TUI, click an
+underlined remote file link for a text preview, then press Escape to return.
+Use the GUI to read supported images. In a native Open Browser workspace,
+the SSH host's cluster identity must match the pinned Browser listener, and
+that listener must grant the exact file to the Browser credential. The legacy
+SSH terminal path does not resolve source-node file links.
+
 Use one policy without relay fields when the publisher and Browser connect
 to one listener. For cross-node delivery, both listeners must be admitted to
 the same cluster and carry the matching document or directory grant:

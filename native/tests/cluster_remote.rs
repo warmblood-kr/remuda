@@ -854,7 +854,7 @@ impl BrowserRelayFixture {
                 "browser": browser_key,
                 "document": RELAY_DOCUMENT,
                 "directory": directory,
-                "source_file": {"uri": LIVE_SOURCE_URI, "path": live_source},
+                "source_file": {"uri": LIVE_SOURCE_URI, "path": live_source, "allow_cluster_read": true},
                 "relay_publisher": encoding::encode_base64(&ingress.public),
             }),
         );
@@ -926,6 +926,25 @@ impl BrowserRelayFixture {
         )
     }
 
+    fn verify_linked_source(&self, revoked: bool) {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "linked_source_fixture_client"])
+            .env("REMUDA_LINK_FIXTURE_NODE", self.egress.fingerprint())
+            .env(
+                "REMUDA_LINK_FIXTURE_REVOKED",
+                if revoked { "1" } else { "0" },
+            )
+            .env("REMUDA_LINK_FIXTURE_FILE", self.egress.root.join("live.md"))
+            .env("REMUDA_RUNTIME_DIR", &self.ingress.runtime)
+            .env("XDG_STATE_HOME", &self.ingress.state)
+            .env("XDG_CONFIG_HOME", self.ingress.root.join("config"))
+            .env("XDG_DATA_HOME", self.ingress.root.join("data"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+
     fn verify_access(&self) {
         assert!(matches!(
             self.direct
@@ -953,6 +972,18 @@ impl BrowserRelayFixture {
             self.sink.read_file(LIVE_SOURCE_URI).unwrap(),
             b"live source bytes"
         );
+        let linked = url::Url::from_file_path(self.egress.root.join("live.md")).unwrap();
+        assert_eq!(
+            self.sink
+                .read_source(&self.egress.fingerprint(), linked.as_str())
+                .unwrap(),
+            b"live source bytes"
+        );
+        assert!(matches!(
+            self.sink
+                .read_source(&self.ingress.fingerprint(), linked.as_str()),
+            Err(remuda_native::net::browser::DriveReadError::Denied)
+        ));
         fs::write(self.egress.root.join("live.md"), "updated source bytes").unwrap();
         assert_eq!(
             self.sink.read_file(LIVE_SOURCE_URI).unwrap(),
@@ -1058,6 +1089,7 @@ impl BrowserRelayFixture {
             .unwrap()
             .state = NodeState::Revoked;
         fs::write(&registry_path, serde_json::to_vec(&registry).unwrap()).unwrap();
+        self.verify_linked_source(true);
         assert!(matches!(
             self.author.send(&Operation::Publish {
                 request: DocumentRequest {
@@ -1075,11 +1107,38 @@ impl BrowserRelayFixture {
 }
 
 #[test]
+#[ignore = "run by the isolated two-node file-link fixture"]
+fn linked_source_fixture_client() {
+    use remuda_native::net::browser::{read_cluster_source, DriveReadError};
+    let node = std::env::var("REMUDA_LINK_FIXTURE_NODE").unwrap();
+    let file = PathBuf::from(std::env::var_os("REMUDA_LINK_FIXTURE_FILE").unwrap());
+    let uri = url::Url::from_file_path(&file).unwrap();
+    if std::env::var("REMUDA_LINK_FIXTURE_REVOKED").as_deref() == Ok("1") {
+        assert!(read_cluster_source(&node, uri.as_str()).is_err());
+        return;
+    }
+    assert_eq!(
+        read_cluster_source(&node, uri.as_str()).unwrap(),
+        b"updated source bytes"
+    );
+    let different = url::Url::from_file_path(file.with_file_name("design.md")).unwrap();
+    assert_eq!(
+        read_cluster_source(&node, different.as_str()),
+        Err(DriveReadError::Denied)
+    );
+    assert_eq!(
+        read_cluster_source("unregistered", uri.as_str()),
+        Err(DriveReadError::Denied)
+    );
+}
+
+#[test]
 fn browser_open_crosses_distinct_admitted_listeners_and_returns_receipt() {
     let harness = std::env::var_os("REMUDA_GUI_DOCUMENT_ACCEPTANCE_TEST_BIN");
     let gui = std::env::var_os("REMUDA_GUI_DOCUMENT_ACCEPTANCE_BIN");
     let fixture = BrowserRelayFixture::new(gui.is_some() || harness.is_some());
     fixture.verify_access();
+    fixture.verify_linked_source(false);
     if let Some(harness) = harness {
         fixture.verify_desktop(
             &harness,
@@ -1294,6 +1353,38 @@ fn wait_for(label: &str, timeout: Duration, mut ready: impl FnMut() -> bool) {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+#[test]
+fn remote_tui_click_opens_granted_source_file() {
+    let fixture = BrowserRelayFixture::new(false);
+    let file = url::Url::from_file_path(fixture.egress.root.join("live.md")).unwrap();
+    fixture.egress.start_session(&format!(
+        "printf '\\033]8;;%s\\007OPEN-SOURCE\\033]8;;\\007\\n' '{}'; sleep 30",
+        file.as_str(),
+    ));
+    let target = format!("{}/proof", fixture.egress.fingerprint());
+    let mut tui = RemoteTui::start(&fixture.ingress, Some(&target));
+    tui.wait_for("OPEN-SOURCE", Duration::from_secs(10));
+    let mut parser = vt100::Parser::new(tui.rows, tui.cols, 0);
+    parser.process(&tui.output.lock().unwrap());
+    let screen = parser.screen();
+    let (row, col) = (0..tui.rows)
+        .flat_map(|row| (0..tui.cols.saturating_sub(11)).map(move |col| (row, col)))
+        .find(|&(row, col)| {
+            "OPEN-SOURCE".chars().enumerate().all(|(index, ch)| {
+                screen
+                    .cell(row, col + index as u16)
+                    .is_some_and(|cell| cell.contents().starts_with(ch))
+            })
+        })
+        .expect("remote file hyperlink was painted");
+    assert!(screen.cell(row, col).unwrap().hyperlink().is_none());
+    let (row, col) = (row + 1, col + 1);
+    write!(tui.writer, "\x1b[<0;{col};{row}M\x1b[<0;{col};{row}m").unwrap();
+    tui.wait_for("live source bytes", Duration::from_secs(10));
+    tui.writer.write_all(b"\x1b").unwrap();
+    tui.wait_for("OPEN-SOURCE", Duration::from_secs(3));
 }
 
 #[test]

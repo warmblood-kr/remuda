@@ -148,6 +148,7 @@ fn forward_request_with_timeout(
 
 /// Fixed remote command and greeting for an already authenticated SSH stream.
 pub const WORKSPACE_COMMAND: &str = "remuda _browser-workspace";
+pub const WORKSPACE_IDENTITY_REQUEST: &[u8] = b"\"BrowserSourceNode\"";
 pub const WORKSPACE_HELLO: &[u8] = b"remuda-browser-workspace-v1\n";
 pub const MAX_WORKSPACE_RESPONSE_BYTES: usize = 1024 * 1024;
 
@@ -156,7 +157,11 @@ pub const MAX_WORKSPACE_RESPONSE_BYTES: usize = 1024 * 1024;
 pub fn serve_workspace(daemon_path: &Path) -> std::io::Result<()> {
     let mut input = std::io::stdin().lock();
     let mut output = std::io::stdout().lock();
-    serve_workspace_stream(&mut input, &mut output, |request| {
+    let identity = crate::cluster::nodes()
+        .ok()
+        .flatten()
+        .map(|(node, _)| node.node_fp);
+    serve_workspace_stream(&mut input, &mut output, identity.as_deref(), |request| {
         if matches!(request, Request::ResizeSession { .. }) {
             match crate::cluster::control::enabled() {
                 Ok(true) => (),
@@ -179,6 +184,7 @@ pub fn serve_workspace(daemon_path: &Path) -> std::io::Result<()> {
 fn serve_workspace_stream(
     input: &mut impl BufRead,
     output: &mut impl Write,
+    identity: Option<&str>,
     mut dispatch: impl FnMut(Request) -> Result<Vec<u8>, &'static str>,
 ) -> std::io::Result<()> {
     use remuda_core::protocol::Response;
@@ -201,18 +207,26 @@ fn serve_workspace_stream(
                 "invalid workspace frame length",
             ));
         }
-        let response = decode_frame(&frame).and_then(|request| match request {
-            Request::List
-            | Request::RenderedSessionList { .. }
-            | Request::CaptureStyled {
-                scrollback: 0..=10_000,
-                ..
-            }
-            | Request::ResizeSession { .. }
-            | Request::Input { .. }
-            | Request::RemoteInputLine { .. } => dispatch(request).map_err(str::to_owned),
-            _ => Err("request is not available to the workspace".into()),
-        });
+        let response = if frame == WORKSPACE_IDENTITY_REQUEST {
+            let value = match identity {
+                Some(identity) => Response::Value(identity.to_owned()),
+                None => Response::error("workspace cluster identity unavailable"),
+            };
+            serde_json::to_vec(&value).map_err(|error| error.to_string())
+        } else {
+            decode_frame(&frame).and_then(|request| match request {
+                Request::List
+                | Request::RenderedSessionList { .. }
+                | Request::CaptureStyled {
+                    scrollback: 0..=10_000,
+                    ..
+                }
+                | Request::ResizeSession { .. }
+                | Request::Input { .. }
+                | Request::RemoteInputLine { .. } => dispatch(request).map_err(str::to_owned),
+                _ => Err("request is not available to the workspace".into()),
+            })
+        };
         let reply = match response {
             Ok(reply) if reply.len() <= MAX_WORKSPACE_RESPONSE_BYTES => reply,
             Ok(_) => serde_json::to_vec(&Response::error("workspace response is too large"))?,
@@ -499,7 +513,7 @@ mod tests {
         }
         let mut seen = Vec::new();
         let mut output = Vec::new();
-        serve_workspace_stream(&mut input.as_slice(), &mut output, |request| {
+        serve_workspace_stream(&mut input.as_slice(), &mut output, None, |request| {
             seen.push(request);
             Ok(serde_json::to_vec(&Response::Ok).unwrap())
         })
@@ -527,11 +541,30 @@ mod tests {
     }
 
     #[test]
+    fn workspace_identity_does_not_dispatch_a_daemon_request() {
+        let mut input = WORKSPACE_IDENTITY_REQUEST.to_vec();
+        input.push(b'\n');
+        let mut output = Vec::new();
+        serve_workspace_stream(&mut input.as_slice(), &mut output, Some("source"), |_| {
+            panic!("identity must not dispatch a daemon operation")
+        })
+        .unwrap();
+        assert!(output.starts_with(WORKSPACE_HELLO));
+        assert_eq!(
+            serde_json::from_slice::<remuda_core::protocol::Response>(
+                &output[WORKSPACE_HELLO.len()..]
+            )
+            .unwrap(),
+            remuda_core::protocol::Response::Value("source".into())
+        );
+    }
+
+    #[test]
     fn workspace_protocol_fails_closed_on_truncated_or_oversized_request() {
         let too_large = vec![b' '; MAX_FRAME_BYTES + 2];
         for mut input in [&b"\"List\""[..], &too_large] {
             let mut output = Vec::new();
-            let error = serve_workspace_stream(&mut input, &mut output, |_| {
+            let error = serve_workspace_stream(&mut input, &mut output, None, |_| {
                 panic!("an incomplete frame must never dispatch");
             })
             .unwrap_err();

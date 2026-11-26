@@ -169,8 +169,10 @@ fn terminal_link(uri: &str, label: &str, interactive: bool) -> Result<String, &'
     if label.is_empty() || label.len() > 2048 || label.chars().any(char::is_control) {
         return Err("Invalid terminal link label");
     }
-    remuda_native::terminal_link::Target::parse(uri)
-        .ok_or("Terminal links require a Remuda Drive URI or an HTTP(S) URL")?;
+    use remuda_native::terminal_link::Target;
+    if !matches!(Target::parse(uri), Some(Target::Drive(_) | Target::Web(_))) {
+        return Err("Terminal links require a Remuda Drive URI or an HTTP(S) URL");
+    }
 
     if interactive {
         Ok(format!("\x1b]8;;{uri}\x1b\\{label}\x1b]8;;\x1b\\"))

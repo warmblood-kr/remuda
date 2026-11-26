@@ -6,6 +6,7 @@ use remuda_core::vfs::VfsUri;
 pub enum Target {
     Drive(VfsUri),
     Web(url::Url),
+    File(url::Url),
 }
 
 impl Target {
@@ -15,6 +16,14 @@ impl Target {
         }
         if uri.starts_with("remuda://") {
             return VfsUri::parse(uri).ok().map(Self::Drive);
+        }
+        if uri.starts_with("file://") {
+            let url = url::Url::parse(uri).ok()?;
+            return (url.host().is_none()
+                && url.path().starts_with('/')
+                && url.query().is_none()
+                && url.fragment().is_none())
+            .then_some(Self::File(url));
         }
         if !(uri.starts_with("https://") || uri.starts_with("http://"))
             || uri.chars().any(|ch| ch.is_whitespace() || ch == '\\')
@@ -39,6 +48,16 @@ mod tests {
         assert_eq!(uri.path, "docs/guide.md");
         assert!(uri.check_cluster("team").is_ok());
         assert!(uri.check_cluster("other").is_err());
+    }
+
+    #[test]
+    fn file_targets_are_explicit_and_have_no_network_authority() {
+        assert!(matches!(
+            Target::parse("file:///tmp/a%20file.md"),
+            Some(Target::File(_))
+        ));
+        assert!(Target::parse("file://another-host/tmp/file.md").is_none());
+        assert!(Target::parse("/tmp/file.md").is_none());
     }
 
     #[test]

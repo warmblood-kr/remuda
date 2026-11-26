@@ -69,10 +69,19 @@ impl DriveSource {
 }
 
 #[derive(Clone)]
+pub(crate) enum FileLinkOrigin {
+    Local,
+    ClusterPeer(String),
+    BrowserPeer(String),
+    Unavailable,
+}
+
+#[derive(Clone)]
 enum DriveAction {
     List(Option<String>),
     More(Option<String>, String),
     Open(String),
+    OpenFile(url::Url, FileLinkOrigin),
     Refresh(Vec<RefreshDirectory>),
 }
 
@@ -122,6 +131,9 @@ impl Drive {
                     }
                     DriveAction::Open(uri) => {
                         read(|uri| source.read(uri), uri, None).map(DriveResult::Document)
+                    }
+                    DriveAction::OpenFile(url, origin) => {
+                        read_linked_file(url, origin, Some(&source)).map(DriveResult::Document)
                     }
                 };
                 if return_result.send((id, result)).is_err() {
@@ -348,6 +360,7 @@ pub(crate) struct Browser {
     displayed: mpsc::Sender<DocumentRequest>,
     document_tabs: Vec<DocumentTab>,
     document_index: usize,
+    link_error: Option<String>,
     active: Content,
     show_drive: bool,
     drive: Option<Drive>,
@@ -472,6 +485,7 @@ impl Browser {
             displayed,
             document_tabs: Vec::new(),
             document_index: 0,
+            link_error: None,
             active: Content::Terminal,
             show_drive: false,
             drive,
@@ -675,6 +689,12 @@ impl Browser {
                         cx.notify();
                         break;
                     }
+                    Err(error) if matches!(drive.last_action, Some(DriveAction::OpenFile(..))) => {
+                        self.link_error = Some(error);
+                        self.active = Content::Document;
+                        self.split = false;
+                        drive.last_action = None;
+                    }
                     Err(error) => drive.error = Some(error),
                 }
                 cx.notify();
@@ -704,6 +724,7 @@ impl Browser {
         window: &mut Window,
         cx: &mut App,
     ) {
+        self.link_error = None;
         let mut document = document;
         let request = document.request.take();
         #[cfg(any(target_os = "macos", windows))]
@@ -729,7 +750,9 @@ impl Browser {
         } else {
             self.hide_native_document(cx);
             self.document_generation = self.document_generation.wrapping_add(1);
-            if document.media.asset_paths().next().is_some() {
+            if document.uri.starts_with("remuda://")
+                && document.media.asset_paths().next().is_some()
+            {
                 if let Some(assets) = &self.assets {
                     let _ = assets
                         .requests
@@ -1146,6 +1169,7 @@ impl Browser {
 
     pub(crate) fn terminal_link_handler(
         browser: gpui::WeakEntity<Self>,
+        origin: FileLinkOrigin,
     ) -> terminal_view::LinkHandler {
         std::rc::Rc::new(move |uri, _, cx| {
             use remuda_native::terminal_link::Target;
@@ -1157,6 +1181,28 @@ impl Browser {
                     });
                 }
                 Some(Target::Web(url)) => cx.open_url(url.as_str()),
+                Some(Target::File(url)) => {
+                    let _ = browser.update(cx, |this, cx| {
+                        let error = match (&mut this.drive, &origin) {
+                            (_, FileLinkOrigin::Unavailable) | (None, _) => Some(
+                                "This connection cannot read files from the session's host.".into(),
+                            ),
+                            (Some(drive), _) if drive.pending => {
+                                Some("A document is already loading. Try again.".into())
+                            }
+                            (Some(drive), _) => {
+                                drive.send(DriveAction::OpenFile(url, origin.clone()));
+                                drive.error.take()
+                            }
+                        };
+                        if let Some(error) = error {
+                            this.link_error = Some(error);
+                            this.active = Content::Document;
+                            this.split = false;
+                        }
+                        cx.notify();
+                    });
+                }
                 None => {}
             }
         })
@@ -1164,7 +1210,8 @@ impl Browser {
 
     fn terminal_panel(&self, cx: &mut Context<Self>) -> AnyElement {
         let panel_bounds = self.panel_bounds.clone();
-        let open = Self::terminal_link_handler(cx.entity().downgrade());
+        let open =
+            Self::terminal_link_handler(cx.entity().downgrade(), FileLinkOrigin::Unavailable);
         div()
             .id("browser-terminal")
             .debug_selector(|| "browser-terminal".into())
@@ -1369,6 +1416,25 @@ impl Browser {
         if dragging {
             self.hide_native_document(cx);
         }
+        if let Some(error) = self.link_error.clone() {
+            self.hide_native_document(cx);
+            return div()
+                .flex_1()
+                .p_6()
+                .child(error)
+                .child(
+                    action_button("dismiss-file-link-error", "Dismiss").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.link_error = None;
+                            if !this.has_document() {
+                                this.select_terminal(cx);
+                            }
+                            cx.notify();
+                        },
+                    )),
+                )
+                .into_any_element();
+        }
         let Some(tab) = self.document_tab() else {
             return div()
                 .flex_1()
@@ -1401,10 +1467,14 @@ impl Browser {
             .size_full()
         });
         let view = cx.weak_entity();
+        let can_open_drive_links = document.uri.starts_with("remuda://");
         let body = document.media.render(
             (pane_width - 48.).max(100.),
             tab.zoom,
             move |path, _, app| {
+                if !can_open_drive_links {
+                    return;
+                }
                 let _ = view.update(app, |this, cx| {
                     this.visit(format!("remuda:///{path}"), false);
                     cx.notify();
@@ -1650,6 +1720,64 @@ fn serve(
     }
 }
 
+fn read_linked_file(
+    url: url::Url,
+    origin: FileLinkOrigin,
+    source: Option<&DriveSource>,
+) -> Result<Document, String> {
+    use std::io::Read as _;
+    let (uri, bytes) = match origin {
+        FileLinkOrigin::Local => {
+            let path = url.to_file_path().map_err(|_| "Invalid local file path")?;
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NONBLOCK);
+            }
+            if !std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+                return Err("The link does not point to a readable regular file.".into());
+            }
+            let file = options.open(path).map_err(|error| error.to_string())?;
+            if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+                return Err("The link does not point to a regular file.".into());
+            }
+            let mut bytes = Vec::new();
+            file.take(1024 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|error| error.to_string())?;
+            if bytes.len() > 1024 * 1024 {
+                return Err("The linked file exceeds the 1 MiB preview limit.".into());
+            }
+            (url.as_str().to_owned(), bytes)
+        }
+        FileLinkOrigin::ClusterPeer(peer) => {
+            let bytes = remuda_native::net::browser::read_cluster_source(&peer, url.as_str())
+                .map_err(|_| "The source node did not provide the linked file. Check its file grant and connection.")?;
+            (format!("{url} [{peer}]"), bytes)
+        }
+        FileLinkOrigin::BrowserPeer(peer) => {
+            let Some(DriveSource::Remote(client)) = source else {
+                return Err("No Browser file grant for the session's host.".into());
+            };
+            let bytes = client.read_source(&peer, url.as_str()).map_err(|_| {
+                "The Browser listener did not grant this file on the session's host."
+            })?;
+            (format!("{url} [{peer}]"), bytes)
+        }
+        FileLinkOrigin::Unavailable => return Err("No file access to the session's host.".into()),
+    };
+    Ok(Document {
+        uri,
+        revision: remuda_native::cluster::vfs::sha256_hex(&bytes),
+        media: browser_media::decode(url.path(), &bytes)?,
+        request: None,
+        #[cfg(any(target_os = "macos", windows))]
+        html: None,
+    })
+}
+
 fn read(
     load: impl FnOnce(&str) -> Result<Vec<u8>, String>,
     uri: String,
@@ -1859,6 +1987,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn local_file_link_reads_a_document_without_falling_back_for_remote_sessions() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("linked file.md");
+        std::fs::write(&source, "# Linked document").unwrap();
+        let uri = url::Url::from_file_path(source).unwrap();
+        let document = read_linked_file(uri.clone(), FileLinkOrigin::Local, None).unwrap();
+        assert_eq!(document.media.title, "Linked document");
+        assert!(read_linked_file(uri, FileLinkOrigin::Unavailable, None).is_err());
+    }
+
+    #[test]
     fn refresh_reloads_visible_folders_and_uses_fresh_pagination() {
         use remuda_native::net::browser::DriveEntry;
 
@@ -1968,6 +2107,7 @@ mod tests {
                 displayed,
                 document_tabs: Vec::new(),
                 document_index: 0,
+                link_error: None,
                 active: Content::Terminal,
                 show_drive: false,
                 drive: Some(Drive {

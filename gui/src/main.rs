@@ -1743,6 +1743,46 @@ mod tests {
     }
 
     #[gpui::test]
+    fn clicking_local_terminal_file_link_opens_the_document_pane(cx: &mut gpui::TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("guide.md");
+        std::fs::write(&path, "# Opened from terminal").unwrap();
+        let uri = url::Url::from_file_path(path).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let focus = cx.focus_handle();
+            let mut gui = LocalGui::new();
+            gui.documents = Some(cx.new(|cx| browser::Browser::local(None, focus, cx)));
+            gui.preview_busy = true;
+            gui.sessions = vec![row("local")];
+            gui.select_session(None, gui.sessions[0].clone());
+            gui.preview = Some(
+                terminal_view::Screen::from_cells(vec![vec![remuda_core::agent::StyledCell {
+                    text: "Open guide".into(),
+                    hyperlink: Some(uri.to_string()),
+                    ..Default::default()
+                }]])
+                .unwrap(),
+            );
+            gui
+        });
+        cx.simulate_resize(gpui::size(px(840.), px(620.)));
+        let link = cx.debug_bounds("terminal-link-0-0").unwrap();
+        cx.simulate_click(link.center(), gpui::Modifiers::none());
+        let timeout = Instant::now() + Duration::from_secs(3);
+        while cx.debug_bounds("browser-document-body").is_none() {
+            assert!(Instant::now() < timeout, "the linked document did not open");
+            view.update_in(cx, |gui, window, cx| {
+                gui.documents
+                    .as_ref()
+                    .unwrap()
+                    .update(cx, |docs, cx| docs.tick(window, cx));
+                cx.notify();
+            });
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[gpui::test]
     fn workspace_tabs_keep_navigation_out_of_the_local_composer(cx: &mut gpui::TestAppContext) {
         let (view, cx) = cx.add_window_view(|window, cx| {
             let input_focus = cx.focus_handle();

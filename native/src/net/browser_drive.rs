@@ -72,10 +72,14 @@ impl std::error::Error for DriveReadError {}
 pub(super) struct SourceFile {
     uri: String,
     path: PathBuf,
+    #[serde(default)]
+    allow_cluster_read: bool,
 }
 
 struct SourceGrant {
     alias: String,
+    path: PathBuf,
+    allow_cluster_read: bool,
     file: Mutex<File>,
 }
 
@@ -99,7 +103,7 @@ impl SourceGrant {
             use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
             options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
         }
-        let file = options.open(source.path)?;
+        let file = options.open(&source.path)?;
         if !file.metadata()?.is_file() {
             return Err(invalid());
         }
@@ -113,6 +117,8 @@ impl SourceGrant {
         }
         Ok(Self {
             alias,
+            path: source.path,
+            allow_cluster_read: source.allow_cluster_read,
             file: Mutex::new(file),
         })
     }
@@ -186,6 +192,31 @@ impl DriveGrant {
             directory,
             source: source.map(SourceGrant::open).transpose()?,
         })
+    }
+
+    pub(super) fn cluster_source_enabled(&self) -> bool {
+        self.source
+            .as_ref()
+            .is_some_and(|source| source.allow_cluster_read)
+    }
+
+    pub(super) fn read_source(
+        &self,
+        uri: &str,
+        offset: u64,
+        revision: Option<&str>,
+        cluster: bool,
+    ) -> Result<DriveChunk, DriveReadError> {
+        use crate::terminal_link::Target;
+        let Some(Target::File(url)) = Target::parse(uri) else {
+            return Err(DriveReadError::Denied);
+        };
+        let path = url.to_file_path().map_err(|_| DriveReadError::Denied)?;
+        self.source
+            .as_ref()
+            .filter(|source| (!cluster || source.allow_cluster_read) && source.path == path)
+            .ok_or(DriveReadError::Denied)?
+            .read_chunk(offset, revision)
     }
 
     pub(super) fn is_source(&self, uri: &str) -> bool {
@@ -489,6 +520,30 @@ fn read_file_using(
     }
 }
 
+pub(super) fn transfer_cluster_source(
+    mut fetch: impl FnMut(u64, Option<&str>) -> Result<Reply, super::ClientError>,
+) -> Result<Vec<u8>, DriveReadError> {
+    let deadline = Instant::now() + READ_TIMEOUT;
+    let mut state = Transfer::default();
+    while Instant::now() < deadline {
+        let response = fetch(
+            state.bytes.len() as u64,
+            state
+                .descriptor
+                .as_ref()
+                .map(|(revision, _)| revision.as_str()),
+        );
+        let chunk = match response {
+            Ok(Reply::Chunk(chunk)) if chunk.size <= 1024 * 1024 => chunk,
+            other => return Err(read_error(other)),
+        };
+        if state.accept(chunk)? {
+            return Ok(state.bytes);
+        }
+    }
+    Err(DriveReadError::Transport)
+}
+
 fn read_error(reply: Result<Reply, super::ClientError>) -> DriveReadError {
     match reply {
         Ok(Reply::Denied) => DriveReadError::Denied,
@@ -758,6 +813,7 @@ fn source_alias_reads_current_file_over_drive_chunks_without_a_store() {
         None,
         None,
         Some(SourceFile {
+            allow_cluster_read: false,
             uri: uri.into(),
             path,
         }),

@@ -22,7 +22,7 @@ use sender::InputSender;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant, SystemTime};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -172,6 +172,7 @@ pub fn cluster_tree_has_sessions(
 }
 
 pub struct ClusterUi {
+    file_link_hits: bool,
     node: String,
     local_targets: Vec<String>,
     sessions: Vec<SessionSummary>,
@@ -564,6 +565,7 @@ impl ClusterUi {
             input_sender,
             input_queue: InputQueue::default(),
             uncertain_visible_since: std::cell::RefCell::new(HashMap::new()),
+            file_link_hits: false,
             notice: None,
             input_notice: None,
             input_notice_target: None,
@@ -1815,7 +1817,7 @@ impl ClusterUi {
                     session
                         .screen
                         .as_ref()
-                        .map(remote_screen_text)
+                        .map(|screen| remote_screen_text(screen, self.file_link_hits))
                         .unwrap_or_default(),
                 )
             },
@@ -2156,7 +2158,7 @@ impl ClusterUi {
                     session
                         .screen
                         .as_ref()
-                        .map(remote_screen_text)
+                        .map(|screen| remote_screen_text(screen, self.file_link_hits))
                         .unwrap_or_default(),
                 ),
                 None => (local_header, local_screen.into()),
@@ -3729,25 +3731,39 @@ fn session_error_suffix(error: Option<&str>) -> String {
     })
 }
 
-fn remote_screen_text(screen: &remuda_core::agent::ScreenSnapshot) -> String {
+fn remote_screen_text(screen: &remuda_core::agent::ScreenSnapshot, file_links: bool) -> String {
     screen
         .cells
         .iter()
-        .map(|row| styled_screen_row(row))
+        .map(|row| preview_screen_row(row, file_links))
         .collect::<Vec<_>>()
         .join("\n")
 }
 
 fn styled_screen_row(row: &[StyledCell]) -> String {
+    preview_screen_row(row, false)
+}
+
+fn preview_screen_row(row: &[StyledCell], file_links: bool) -> String {
     let safe: Vec<_> = row
         .iter()
         .map(|cell| {
             let mut cell = cell.clone();
             cell.text = crate::text::strip_terminal_controls(&cell.text).into_owned();
+            if file_links
+                && cell.hyperlink.as_deref().is_some_and(|uri| {
+                    matches!(
+                        crate::terminal_link::Target::parse(uri),
+                        Some(crate::terminal_link::Target::File(_))
+                    )
+                })
+            {
+                cell.underline = true;
+            }
             cell
         })
         .collect();
-    crate::tui::render_styled_row(&safe)
+    crate::tui::render_preview_row(&safe, file_links)
 }
 
 struct EmptyRemoteSource;
@@ -4430,6 +4446,110 @@ fn resize_active_pane(
     );
 }
 
+#[derive(Default)]
+struct FileMouseCapture(bool);
+
+impl FileMouseCapture {
+    fn set(&mut self, enable: bool) -> io::Result<()> {
+        if enable != self.0 {
+            if enable {
+                crossterm::execute!(io::stdout(), crossterm::event::EnableMouseCapture)?;
+            } else {
+                crossterm::execute!(io::stdout(), crossterm::event::DisableMouseCapture)?;
+            }
+            self.0 = enable;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for FileMouseCapture {
+    fn drop(&mut self) {
+        let _ = self.set(false);
+    }
+}
+
+struct LinkedFilePreview {
+    result: mpsc::Receiver<Result<String, &'static str>>,
+    content: Option<Result<String, &'static str>>,
+    offset: usize,
+}
+
+impl LinkedFilePreview {
+    fn load(node: String, uri: String, loading: Arc<AtomicBool>) -> Option<Self> {
+        if loading.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        let (send, result) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let content = crate::net::browser::read_cluster_source(&node, &uri)
+                .map_err(|_| {
+                    "The source node did not provide this file. Check its grant and connection."
+                })
+                .and_then(|bytes| {
+                    String::from_utf8(bytes)
+                        .map_err(|_| "This file needs a graphical document viewer.")
+                });
+            let _ = send.send(content);
+            loading.store(false, Ordering::Release);
+        });
+        Some(Self {
+            result,
+            content: None,
+            offset: 0,
+        })
+    }
+
+    fn frame(&mut self, cols: u16, rows: u16) -> String {
+        if self.content.is_none() {
+            self.content = self.result.try_recv().ok();
+        }
+        let hint = truncate("Linked file · ↑/↓ scroll · Esc back", cols as usize);
+        let body = match &self.content {
+            Some(Ok(body)) => body.as_str(),
+            Some(Err(error)) => error,
+            None => "Loading from the source node…",
+        };
+        let height = rows.saturating_sub(2) as usize;
+        self.offset = self.offset.min(body.lines().count().saturating_sub(height));
+        let mut frame = vec![hint, String::new()];
+        frame.extend(
+            body.lines()
+                .skip(self.offset)
+                .take(height)
+                .map(|line| truncate(&crate::text::strip_terminal_controls(line), cols as usize)),
+        );
+        frame.join("\n")
+    }
+
+    fn event(&mut self, event: crossterm::event::Event, rows: u16) -> bool {
+        use crossterm::event::{Event, KeyCode, KeyEventKind};
+        let Event::Key(key) = event else { return false };
+        if key.kind != KeyEventKind::Press {
+            return false;
+        }
+        let page = rows.saturating_sub(2).max(1) as usize;
+        match key.code {
+            KeyCode::Esc => return true,
+            KeyCode::Up => self.offset = self.offset.saturating_sub(1),
+            KeyCode::Down => self.offset = self.offset.saturating_add(1),
+            KeyCode::PageUp => self.offset = self.offset.saturating_sub(page),
+            KeyCode::PageDown => self.offset = self.offset.saturating_add(page),
+            _ => {}
+        }
+        false
+    }
+}
+
+fn is_file_link(cell: &vt100::Cell) -> bool {
+    cell.hyperlink().is_some_and(|uri| {
+        matches!(
+            crate::terminal_link::Target::parse(uri),
+            Some(crate::terminal_link::Target::File(_))
+        )
+    })
+}
+
 fn run_loop(
     path: &Path,
     node: &str,
@@ -4446,7 +4566,8 @@ fn run_loop(
     let replies = remote_calls.as_ref().map(RemoteDispatcher::finished);
     let mut local_views = LocalViewLoader::new();
     let local_view_finished = local_views.finished();
-    // Moves when a remote poll, remote call, local view or remote view reply lands.
+    let file_loading = Arc::new(AtomicBool::new(false));
+    // Moves when a remote poll, call, view, or linked-file reply lands.
     let wake = || {
         remote_source
             .generation()
@@ -4457,6 +4578,7 @@ fn run_loop(
             )
             .wrapping_add(local_view_finished.load(Ordering::SeqCst))
             .wrapping_add(remote_view_finished.load(Ordering::SeqCst))
+            .wrapping_add(u64::from(file_loading.load(Ordering::Acquire)))
     };
     let mut ui = ClusterUi::with_sender(node, list(path)?, clock.now(), InputSender::random()?);
     if let Some((identity, _)) = crate::cluster::nodes()? {
@@ -4469,7 +4591,11 @@ fn run_loop(
     ui.remote_synced(remote_source);
     select_target_with_remote_wait(&mut ui, target, remote_source, Duration::from_secs(5))?;
     focus_initial_remote_composer(&mut ui, clock.now());
+    ui.file_link_hits = true;
     let mut previous = None;
+    let mut file_mouse = FileMouseCapture::default();
+    let mut file_preview: Option<LinkedFilePreview> = None;
+    let mut link_press = None;
     let mut last_full_repaint = clock.now();
     let mut frames = frame_writer()?;
     loop {
@@ -4503,9 +4629,21 @@ fn run_loop(
         );
         let captured = capture_local_pane(&mut ui, path, clock);
         let body = captured.unwrap_or_default();
-        let frame = ui.render(cols, rows, &body, clock);
+        let frame = match &mut file_preview {
+            Some(preview) => preview.frame(cols, rows),
+            None => ui.render(cols, rows, &body, clock),
+        };
         let mut next = vt100::Parser::new(rows, cols, 0);
         next.process(format!("\x1b[H\x1b[2J{}", terminal_frame(&frame)).as_bytes());
+        let links_active = file_preview.is_none()
+            && matches!(ui.remote_active, Some(RemoteSelection::Session { .. }))
+            && (0..rows).any(|row| {
+                (0..cols).any(|col| next.screen().cell(row, col).is_some_and(is_file_link))
+            });
+        file_mouse.set(links_active)?;
+        if !links_active {
+            link_press = None;
+        }
         let output = present_with_recovery(
             previous.as_ref().map(vt100::Parser::screen),
             next.screen(),
@@ -4529,6 +4667,51 @@ fn run_loop(
             ui.input_wait(Instant::now()),
         )? {
             let event = crossterm::event::read()?;
+            if let Some(preview) = &mut file_preview {
+                if preview.event(event, rows) {
+                    file_preview = None;
+                    previous = None;
+                }
+                continue;
+            }
+            if let crossterm::event::Event::Mouse(mouse) = event {
+                use crossterm::event::{MouseButton, MouseEventKind};
+                let point = (mouse.row, mouse.column);
+                let link = previous
+                    .as_ref()
+                    .and_then(|frame| frame.screen().cell(point.0, point.1))
+                    .filter(|cell| is_file_link(cell))
+                    .and_then(vt100::Cell::hyperlink);
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        link_press = link
+                            .zip(ui.remote_active.as_ref())
+                            .map(|(uri, origin)| (point, uri.to_owned(), origin.clone()));
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        if let (
+                            Some((pressed, uri, origin)),
+                            Some(target),
+                            Some(current @ RemoteSelection::Session { node, .. }),
+                        ) = (link_press.take(), link, &ui.remote_active)
+                        {
+                            if pressed == point && uri == target && &origin == current {
+                                file_preview = LinkedFilePreview::load(
+                                    node.clone(),
+                                    uri,
+                                    file_loading.clone(),
+                                );
+                                if file_preview.is_some() {
+                                    previous = None;
+                                }
+                            }
+                        }
+                    }
+                    MouseEventKind::Drag(_) => link_press = None,
+                    _ => {}
+                }
+                continue;
+            }
             let redraw = ui.is_redraw(&event);
             if resize_requires_full_repaint(&event) || redraw {
                 previous = None;
@@ -5628,6 +5811,29 @@ mod tests {
     }
 
     #[test]
+    fn remote_file_hyperlinks_are_retained_for_hit_testing_but_not_sent_to_the_host() {
+        let uri = "file:///source/guide.md";
+        let row = super::preview_screen_row(
+            &[StyledCell {
+                text: "guide".into(),
+                hyperlink: Some(uri.into()),
+                ..Default::default()
+            }],
+            true,
+        );
+        let parsed = parsed_frame(&row, 80, 24);
+        let cell = parsed.screen().cell(0, 0).unwrap();
+        assert!(super::is_file_link(cell));
+        assert!(cell.underline());
+        let transmitted = present(None, parsed.screen());
+        let mut terminal = vt100::Parser::new(24, 80, 0);
+        terminal.process(&transmitted);
+        assert_eq!(terminal.screen().contents().trim_end(), "guide");
+        assert_eq!(terminal.screen().cell(0, 0).unwrap().hyperlink(), None);
+        assert!(terminal.screen().cell(0, 0).unwrap().underline());
+    }
+
+    #[test]
     fn presenter_emits_only_the_changed_cell() {
         let previous = parsed_frame("hello", 80, 24);
         let next = parsed_frame("hallo", 80, 24);
@@ -5869,7 +6075,7 @@ mod tests {
             let mut screen = remote_screen("important output");
             screen.cells.extend(vec![vec![cell.clone()]; 3]);
             screen.wrapped.extend([false; 3]);
-            let body = super::remote_screen_text(&screen);
+            let body = super::remote_screen_text(&screen, false);
             let visible = super::visible_remote_pane_lines(&body, true, 2);
             assert_eq!(visible.len(), 2);
             assert!(
