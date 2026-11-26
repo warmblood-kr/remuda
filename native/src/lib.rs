@@ -70,6 +70,7 @@ pub mod vfs_publish;
 pub mod vfs_serve;
 pub mod vfs_sync_files;
 pub(crate) mod windows_security;
+pub(crate) mod workdir_read;
 
 /// Path used to persist command history for the REPL binary.
 #[doc(hidden)]

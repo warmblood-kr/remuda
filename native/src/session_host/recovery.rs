@@ -7,7 +7,7 @@ use super::inventory::model::{
 };
 use super::result::Completion;
 use super::wire::InputAct;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub(crate) enum Progress {
@@ -27,6 +27,18 @@ pub(crate) enum Progress {
 pub(crate) const CLOSING: &str = "closing";
 /// Per-instance remote input policy. Missing or unknown data is disabled.
 pub(crate) const REMOTE_INPUT_POLICY: &str = "remote-input-policy";
+
+/// Canonical explicit cwd captured when this exact instance was reserved.
+pub(crate) const LAUNCH_WORKDIR: &str = "launch-workdir";
+
+pub(crate) fn launch_workdir(entry: &model::Entry) -> Option<PathBuf> {
+    let value = entry.metadata.get(LAUNCH_WORKDIR)?;
+    if value.schema != 1 {
+        return None;
+    }
+    let path = serde_json::from_str::<PathBuf>(value.payload.get()).ok()?;
+    path.is_absolute().then_some(path)
+}
 
 pub(crate) fn remote_input_disabled(entry: &model::Entry) -> bool {
     let Some(value) = entry.metadata.get(REMOTE_INPUT_POLICY) else {

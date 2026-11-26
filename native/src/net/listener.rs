@@ -133,7 +133,7 @@ type JoinAdmitter = Arc<dyn Fn(&[u8], Option<&str>) -> io::Result<()> + Send + S
 type FrameDispatcher = Arc<dyn Fn(&[u8], &[u8]) -> io::Result<Vec<u8>> + Send + Sync>;
 
 struct ListenerState {
-    browser: Option<super::browser::Service>,
+    browser: Option<Arc<super::browser::Service>>,
     responder_private: Zeroizing<Vec<u8>>,
     replay: Arc<Mutex<replay::ReplayWindow>>,
     unknown_replay: Arc<Mutex<replay::ReplayWindow>>,
@@ -450,7 +450,7 @@ pub(crate) fn bind_with_security(
             join_tokens,
             admit_join: Arc::new(cluster::admit_join_locked),
             audit: Arc::new(cluster::audit::AuditSink::default_state_dir()),
-            browser: super::browser::Service::configured()?,
+            browser: super::browser::Service::configured(identity_node.node_fp)?.map(Arc::new),
         }),
         authorize,
         dispatch,
@@ -465,6 +465,10 @@ pub fn serve(config: ListenerConfig, daemon_path: &Path) -> io::Result<()> {
 }
 
 impl Listener {
+    pub(crate) fn browser_service(&self) -> Option<Arc<super::browser::Service>> {
+        self.state.browser.clone()
+    }
+
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
     }

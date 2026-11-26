@@ -36,11 +36,13 @@ struct Document {
 enum DriveSource {
     Remote(Arc<Client>),
     Local,
+    SessionFilesOnly,
 }
 
 impl DriveSource {
     fn read(&self, uri: &str) -> Result<Vec<u8>, String> {
         match self {
+            Self::SessionFilesOnly => return Err("No Drive credentials configured.".into()),
             Self::Remote(client) => client.read_file(uri),
             Self::Local => remuda_native::net::browser::read_local_drive(uri),
         }
@@ -52,6 +54,7 @@ impl DriveSource {
         after: Option<String>,
     ) -> Result<DriveListing, String> {
         match self {
+            Self::SessionFilesOnly => Err("No Drive credentials configured.".into()),
             Self::Remote(client) => list(
                 client,
                 match after {
@@ -71,8 +74,20 @@ impl DriveSource {
 #[derive(Clone)]
 pub(crate) enum FileLinkOrigin {
     Local,
-    ClusterPeer(String),
-    BrowserPeer(String),
+    ClusterPeer {
+        peer: String,
+        session: String,
+        instance: String,
+    },
+    LocalSession {
+        session: String,
+        instance: String,
+    },
+    BrowserPeer {
+        workspace: crate::ssh_workspace::SshWorkspace,
+        session: String,
+        instance: String,
+    },
     Unavailable,
 }
 
@@ -133,7 +148,7 @@ impl Drive {
                         read(|uri| source.read(uri), uri, None).map(DriveResult::Document)
                     }
                     DriveAction::OpenFile(url, origin) => {
-                        read_linked_file(url, origin, Some(&source)).map(DriveResult::Document)
+                        read_linked_file(url, origin).map(DriveResult::Document)
                     }
                 };
                 if return_result.send((id, result)).is_err() {
@@ -350,7 +365,7 @@ impl DocumentTab {
 enum BrowserMode {
     Standalone,
     Local,
-    Ssh,
+    Ssh(crate::ssh_workspace::SshWorkspace),
 }
 
 pub(crate) struct Browser {
@@ -468,13 +483,23 @@ impl Browser {
         let (displayed, results) = mpsc::channel();
         let remote = client.map(Arc::new);
         if let Some(poller) = remote.clone() {
-            std::thread::spawn(move || serve(poller, send_document, results));
+            let origin = match &mode {
+                BrowserMode::Standalone => DeliveryConnection::Unsupported,
+                BrowserMode::Local => DeliveryConnection::Local,
+                BrowserMode::Ssh(workspace) => DeliveryConnection::Ssh(workspace.clone()),
+            };
+            std::thread::spawn(move || serve(poller, origin, send_document, results));
         }
         let source = remote
             .map(DriveSource::Remote)
             .or_else(|| matches!(mode, BrowserMode::Local).then_some(DriveSource::Local))
             .map(Arc::new);
-        let drive = source.clone().map(Drive::new);
+        let drive = source
+            .clone()
+            .or_else(|| {
+                matches!(mode, BrowserMode::Ssh(_)).then(|| Arc::new(DriveSource::SessionFilesOnly))
+            })
+            .map(Drive::new);
         let assets = source.clone().map(Assets::new);
         #[cfg(any(target_os = "macos", windows))]
         let native_source = source.filter(|_| native_document::enabled());
@@ -521,10 +546,15 @@ impl Browser {
         )
     }
 
-    pub(crate) fn ssh(client: Option<Client>, focus: FocusHandle, cx: &mut App) -> Self {
+    pub(crate) fn ssh(
+        workspace: crate::ssh_workspace::SshWorkspace,
+        client: Option<Client>,
+        focus: FocusHandle,
+        cx: &mut App,
+    ) -> Self {
         Self::new(
             String::new(),
-            BrowserMode::Ssh,
+            BrowserMode::Ssh(workspace),
             client,
             None,
             Screen::default(),
@@ -1645,8 +1675,65 @@ impl Drop for Browser {
     }
 }
 
+enum DeliveryConnection {
+    Unsupported,
+    Local,
+    Ssh(crate::ssh_workspace::SshWorkspace),
+}
+
+impl DeliveryConnection {
+    fn read(&self, client: &Client, request: DocumentRequest) -> Result<Document, String> {
+        if !request.uri.starts_with("file://") {
+            return read(
+                |uri| client.read_file(uri).map_err(|error| error.to_string()),
+                request.uri.clone(),
+                Some(request),
+            );
+        }
+        let Some(origin) = request.origin.as_ref() else {
+            return Err("Document source is missing.".into());
+        };
+        let session = origin.session.clone();
+        let instance = origin.instance_id.clone();
+        let origin = match self {
+            Self::Local
+                if remuda_native::cluster::nodes()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|(local, _)| local.node_fp == origin.node) =>
+            {
+                FileLinkOrigin::LocalSession { session, instance }
+            }
+            Self::Local => FileLinkOrigin::ClusterPeer {
+                peer: origin.node.clone(),
+                session,
+                instance,
+            },
+            Self::Ssh(workspace) if workspace.source_node() == Some(&origin.node) => {
+                FileLinkOrigin::BrowserPeer {
+                    workspace: workspace.clone(),
+                    session,
+                    instance,
+                }
+            }
+            Self::Ssh(_) | Self::Unsupported => {
+                return Err("Document source is not connected.".into())
+            }
+        };
+        let Some(remuda_native::terminal_link::Target::File(url)) =
+            remuda_native::terminal_link::Target::parse(&request.uri)
+        else {
+            return Err("Invalid source file URI.".into());
+        };
+        let mut document = read_linked_file(url, origin)?;
+        document.request = Some(request);
+        Ok(document)
+    }
+}
+
 fn serve(
     client: Arc<Client>,
+    connection: DeliveryConnection,
     documents: mpsc::SyncSender<Document>,
     results: mpsc::Receiver<DocumentRequest>,
 ) {
@@ -1661,11 +1748,7 @@ fn serve(
     // Keep the active subscription alive while a document downloads or decodes.
     std::thread::spawn(move || {
         while let Ok(request) = requests.recv() {
-            let result = read(
-                |uri| reader.read_file(uri).map_err(|error| error.to_string()),
-                request.uri.clone(),
-                Some(request.clone()),
-            );
+            let result = connection.read(&reader, request.clone());
 
             if loaded.send((request, result)).is_err() {
                 break;
@@ -1720,11 +1803,7 @@ fn serve(
     }
 }
 
-fn read_linked_file(
-    url: url::Url,
-    origin: FileLinkOrigin,
-    source: Option<&DriveSource>,
-) -> Result<Document, String> {
+fn read_linked_file(url: url::Url, origin: FileLinkOrigin) -> Result<Document, String> {
     use std::io::Read as _;
     let (uri, bytes) = match origin {
         FileLinkOrigin::Local => {
@@ -1752,19 +1831,47 @@ fn read_linked_file(
             }
             (url.as_str().to_owned(), bytes)
         }
-        FileLinkOrigin::ClusterPeer(peer) => {
-            let bytes = remuda_native::net::browser::read_cluster_source(&peer, url.as_str())
-                .map_err(|_| "The source node did not provide the linked file. Check its file grant and connection.")?;
+        FileLinkOrigin::LocalSession { session, instance } => {
+            let socket = remuda_native::daemon::socket_path("default");
+            let bytes = remuda_native::net::browser::read_session_file_using(
+                &session,
+                &instance,
+                url.as_str(),
+                |request| remuda_native::client::request(&socket, &request),
+            )
+            .map_err(|error| error.to_string())?;
+            (url.as_str().to_owned(), bytes)
+        }
+        FileLinkOrigin::ClusterPeer {
+            peer,
+            session,
+            instance,
+        } => {
+            let bytes = remuda_native::net::browser::read_cluster_session_file(
+                &peer,
+                &session,
+                &instance,
+                url.as_str(),
+            )
+            .map_err(|error| error.to_string())?;
             (format!("{url} [{peer}]"), bytes)
         }
-        FileLinkOrigin::BrowserPeer(peer) => {
-            let Some(DriveSource::Remote(client)) = source else {
-                return Err("No Browser file grant for the session's host.".into());
-            };
-            let bytes = client.read_source(&peer, url.as_str()).map_err(|_| {
-                "The Browser listener did not grant this file on the session's host."
-            })?;
-            (format!("{url} [{peer}]"), bytes)
+        FileLinkOrigin::BrowserPeer {
+            workspace,
+            session,
+            instance,
+        } => {
+            let bytes = remuda_native::net::browser::read_session_file_using(
+                &session,
+                &instance,
+                url.as_str(),
+                |request| workspace.request(&request),
+            )
+            .map_err(|error| error.to_string())?;
+            let source = workspace
+                .source_node()
+                .unwrap_or_else(|| workspace.destination());
+            (format!("{url} [{source}]"), bytes)
         }
         FileLinkOrigin::Unavailable => return Err("No file access to the session's host.".into()),
     };
@@ -1992,9 +2099,9 @@ mod tests {
         let source = directory.path().join("linked file.md");
         std::fs::write(&source, "# Linked document").unwrap();
         let uri = url::Url::from_file_path(source).unwrap();
-        let document = read_linked_file(uri.clone(), FileLinkOrigin::Local, None).unwrap();
+        let document = read_linked_file(uri.clone(), FileLinkOrigin::Local).unwrap();
         assert_eq!(document.media.title, "Linked document");
-        assert!(read_linked_file(uri, FileLinkOrigin::Unavailable, None).is_err());
+        assert!(read_linked_file(uri, FileLinkOrigin::Unavailable).is_err());
     }
 
     #[test]
@@ -2055,6 +2162,7 @@ mod tests {
         let request = DocumentRequest {
             id: "example".into(),
             uri: uri.into(),
+            origin: None,
         };
         for source in [None, Some(request)] {
             let result = read(|_| Ok(html.to_vec()), uri.into(), source.clone()).unwrap();
@@ -2078,6 +2186,33 @@ mod tests {
             cx.background_executor
                 .advance_clock(Duration::from_millis(120));
             cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[gpui::test]
+    #[ignore = "launched by the isolated session workdir Browser acceptance"]
+    fn daemonless_workdir_receipt_acceptance(cx: &mut gpui::TestAppContext) {
+        let workspace = crate::ssh_workspace::SshWorkspace::connect("fixture").unwrap();
+        let client = Client::from_env().unwrap().unwrap();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus = cx.focus_handle();
+            focus.focus(window, cx);
+            Browser::ssh(workspace, Some(client), focus, cx)
+        });
+        let end = Instant::now() + Duration::from_secs(40);
+        while Instant::now() < end {
+            cx.background_executor
+                .advance_clock(Duration::from_millis(120));
+            cx.run_until_parked();
+            view.update_in(cx, |browser, window, cx| {
+                browser.tick(window, cx);
+                if let Some(tab) = browser.document_tab() {
+                    assert_eq!(browser.document_tabs.len(), 1);
+                    assert_eq!(tab.document.media.title, "new.md");
+                }
+            });
+            cx.update(|window, app| window.draw(app).clear(app));
             std::thread::sleep(Duration::from_millis(20));
         }
     }
@@ -2176,6 +2311,7 @@ mod tests {
         let request = DocumentRequest {
             id: "requested-plan".into(),
             uri: document(None).uri,
+            origin: None,
         };
         send_document
             .send(document(Some(request.clone())))
@@ -2430,6 +2566,7 @@ mod tests {
         let update = DocumentRequest {
             id: "updated-plan".into(),
             uri: request.uri.clone(),
+            origin: None,
         };
         view.update_in(cx, |browser, window, cx| {
             browser.open_document(document(None), true, window, cx);

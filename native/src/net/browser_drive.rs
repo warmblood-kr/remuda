@@ -128,36 +128,43 @@ impl SourceGrant {
         offset: u64,
         revision: Option<&str>,
     ) -> Result<DriveChunk, DriveReadError> {
-        const MAX_SOURCE_BYTES: usize = 1024 * 1024;
-        if offset != 0 && revision.is_none() {
-            return Err(DriveReadError::Unavailable);
-        }
         let mut file = self.file.lock().map_err(|_| DriveReadError::Unavailable)?;
-        file.rewind().map_err(|_| DriveReadError::Unavailable)?;
-        let mut bytes = Vec::new();
-        (&mut *file)
-            .take((MAX_SOURCE_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map_err(|_| DriveReadError::Unavailable)?;
-        if bytes.len() > MAX_SOURCE_BYTES {
-            return Err(DriveReadError::Unavailable);
-        }
-        let current = vfs::sha256_hex(&bytes);
-        if revision.is_some_and(|expected| expected != current) {
-            return Err(DriveReadError::Changed);
-        }
-        let size = bytes.len() as u64;
-        if offset != 0 && offset >= size {
-            return Err(DriveReadError::Unavailable);
-        }
-        let end = (offset + CHUNK_BYTES as u64).min(size);
-        Ok(DriveChunk {
-            revision: current,
-            offset,
-            size,
-            data_b64: STANDARD.encode(&bytes[offset as usize..end as usize]),
-        })
+        read_regular_chunk(&mut file, offset, revision)
     }
+}
+
+pub(super) fn read_regular_chunk(
+    file: &mut File,
+    offset: u64,
+    revision: Option<&str>,
+) -> Result<DriveChunk, DriveReadError> {
+    const MAX_SOURCE_BYTES: usize = 1024 * 1024;
+    if offset != 0 && revision.is_none() {
+        return Err(DriveReadError::Unavailable);
+    }
+    file.rewind().map_err(|_| DriveReadError::Unavailable)?;
+    let mut bytes = Vec::new();
+    file.take((MAX_SOURCE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| DriveReadError::Unavailable)?;
+    if bytes.len() > MAX_SOURCE_BYTES {
+        return Err(DriveReadError::Unavailable);
+    }
+    let current = vfs::sha256_hex(&bytes);
+    if revision.is_some_and(|expected| expected != current) {
+        return Err(DriveReadError::Changed);
+    }
+    let size = bytes.len() as u64;
+    if offset != 0 && offset >= size {
+        return Err(DriveReadError::Unavailable);
+    }
+    let end = (offset + CHUNK_BYTES as u64).min(size);
+    Ok(DriveChunk {
+        revision: current,
+        offset,
+        size,
+        data_b64: STANDARD.encode(&bytes[offset as usize..end as usize]),
+    })
 }
 
 pub(super) struct DriveGrant {

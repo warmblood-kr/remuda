@@ -674,6 +674,31 @@ impl Registry {
         }
     }
 
+    /// The canonical launch directory of this exact, live session instance.
+    /// This stays on the source node and is never part of session discovery.
+    pub fn launch_workdir(&self, name: &str, instance_id: &str) -> Option<std::path::PathBuf> {
+        if let Some(session) = self.lock().get(name) {
+            if session.instance_id() != instance_id || !session.is_alive() {
+                return None;
+            }
+            return session.launch_workdir().map(std::path::Path::to_path_buf);
+        }
+        let handle = self.hosted(name)?;
+        if handle.identity().instance != instance_id {
+            return None;
+        }
+        let workdir = handle.launch_workdir()?;
+        if handle.inspect().ok()?.lifecycle != Lifecycle::Running {
+            return None;
+        }
+        // Hosted inspection runs without the registry lock.
+        let current = self.hosted_lock();
+        current
+            .get(name)
+            .filter(|current| Arc::ptr_eq(current, &handle))
+            .map(|_| workdir.to_path_buf())
+    }
+
     /// Look up a tracked session identity, legacy or host-backed, without
     /// reaping exited sessions. A host-backed id survives a daemon restart.
     pub fn name_for_id(&self, id: &str) -> Option<String> {

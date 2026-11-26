@@ -78,6 +78,17 @@ reports the display result as JSON. Use the same request ID when retrying
 the same document. An `unknown` result means Browser could have received
 the request, but the command could not confirm display.
 
+An ordinary Remuda session can run
+`remuda browser open-document --session REQUEST_ID remuda:///path` without
+holding the publisher private key. The daemon identifies the live session and
+adds its source node and instance to the receipt. The existing listener and
+Drive grant govern VFS routes. A session can also pass an absolute `file://`
+URI under its recorded workdir. To read that file, Open Browser must have an
+authenticated SSH workspace on its source node, or Open Remuda must have an
+admitted connection to the source. See [session workdir policy](docs/cluster-security.md#session-workdir-file-links).
+Set `"session_publish": false` in the listener policy to disable local session
+publication. Use a unique request ID for each new document.
+
 This configuration serves one active Browser and one bounded UTF-8
 document. Recent results are held in memory on the serving node. The GUI
 uses its user credential directly over the pinned listener connection.

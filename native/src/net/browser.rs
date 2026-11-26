@@ -1,7 +1,7 @@
 //! Scoped document-open messages over the cluster's pinned Noise transport.
 
 use super::browser_delivery::Delivery;
-pub use super::browser_delivery::{DocumentRequest, Outcome, DELIVERY_TTL};
+pub use super::browser_delivery::{BrowserDocumentOrigin, DocumentRequest, Outcome, DELIVERY_TTL};
 use super::cluster_client::{ClientError, ClusterClient};
 use crate::cluster::{
     encoding,
@@ -9,7 +9,7 @@ use crate::cluster::{
     vfs_sync,
 };
 use serde::{Deserialize, Serialize};
-use std::io;
+use std::io::{self, Read as _};
 use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -99,14 +99,17 @@ struct Policy {
     route_to: Option<String>,
     /// Static public key of the node allowed to relay this user's opens.
     relay_publisher: Option<String>,
+    session_publish: Option<bool>,
 }
 
-pub(super) struct Service {
+pub(crate) struct Service {
     publisher: Vec<u8>,
     browser: Vec<u8>,
     drive: DriveGrant,
     route_to: Option<String>,
     relay_publisher: Option<Vec<u8>>,
+    session_publish: bool,
+    node: String,
     delivery: Mutex<Delivery>,
 }
 
@@ -125,7 +128,7 @@ fn valid_id(value: &str) -> bool {
 }
 
 impl Service {
-    pub(super) fn configured() -> io::Result<Option<Self>> {
+    pub(super) fn configured(node: String) -> io::Result<Option<Self>> {
         let Some(path) = std::env::var_os("REMUDA_BROWSER_POLICY") else {
             return Ok(None);
         };
@@ -162,8 +165,53 @@ impl Service {
             drive,
             route_to: policy.route_to,
             relay_publisher,
+            session_publish: policy.session_publish.unwrap_or(true),
+            node,
             delivery: Mutex::new(Delivery::default()),
         }))
+    }
+
+    /// Invoked only by local daemon IPC after resolving and validating a live caller.
+    pub(crate) fn publish_from_session(
+        &self,
+        id: String,
+        uri: String,
+        session: String,
+        instance_id: String,
+    ) -> Option<(BrowserDocumentOrigin, Outcome)> {
+        if !self.session_publish || !valid_id(&id) || !self.authorizes_session_document(&uri) {
+            return None;
+        }
+        let origin = BrowserDocumentOrigin {
+            node: self.node.clone(),
+            session,
+            instance_id,
+        };
+        let request = DocumentRequest {
+            id,
+            uri,
+            origin: Some(origin.clone()),
+        };
+        let outcome = if let Some(target) = &self.route_to {
+            match relay(target, request) {
+                Reply::Outcome(outcome) => outcome,
+                _ => return None,
+            }
+        } else {
+            if self.relay_publisher.is_some() {
+                return None;
+            }
+            self.delivery.lock().ok()?.publish(request, Instant::now())
+        };
+        Some((origin, outcome))
+    }
+
+    fn authorizes_session_document(&self, uri: &str) -> bool {
+        self.drive.authorizes_document(uri)
+            || matches!(
+                crate::terminal_link::Target::parse(uri),
+                Some(crate::terminal_link::Target::File(_))
+            )
     }
 
     pub(super) fn authenticates(&self, payload: &[u8], peer: &[u8], admitted: bool) -> bool {
@@ -209,6 +257,7 @@ impl Service {
         if let Operation::Publish { request } = &operation {
             if let Some(target) = &self.route_to {
                 return if peer == self.publisher
+                    && request.origin.is_none()
                     && self.drive.authorizes_document(&request.uri)
                     && valid_id(&request.id)
                 {
@@ -271,6 +320,10 @@ impl Service {
             }
             _ => {}
         }
+        self.handle_delivery(operation, peer, admitted)
+    }
+
+    fn handle_delivery(&self, operation: Operation, peer: &[u8], admitted: bool) -> Reply {
         let Ok(mut delivery) = self.delivery.lock() else {
             return Reply::Invalid;
         };
@@ -279,6 +332,7 @@ impl Service {
             Operation::Publish { request }
                 if peer == self.publisher
                     && self.relay_publisher.is_none()
+                    && request.origin.is_none()
                     && self.drive.authorizes_document(&request.uri)
                     && valid_id(&request.id) =>
             {
@@ -287,8 +341,15 @@ impl Service {
             Operation::RelayPublish { request }
                 if admitted
                     && self.relay_publisher.as_deref() == Some(peer)
-                    && self.drive.authorizes_document(&request.uri)
-                    && valid_id(&request.id) =>
+                    && valid_id(&request.id)
+                    && match &request.origin {
+                        Some(origin) => {
+                            self.session_publish
+                                && origin.node == encoding::fingerprint(peer)
+                                && self.authorizes_session_document(&request.uri)
+                        }
+                        None => self.drive.authorizes_document(&request.uri),
+                    } =>
             {
                 Reply::Outcome(delivery.publish(request, now))
             }
@@ -391,6 +452,140 @@ pub fn read_cluster_source(fingerprint: &str, uri: &str) -> Result<Vec<u8>, Driv
         let reply =
             client.request_payload(address, &pinned_static_key, &private, &payload, false)?;
         serde_json::from_slice(&reply).map_err(|_| ClientError::BadResponse)
+    })
+}
+
+/// Source-side authorization is based on the daemon's current session instance.
+pub(crate) fn read_session_file_chunk(
+    session: &str,
+    root: &std::path::Path,
+    uri: &str,
+    offset: u64,
+    revision: Option<&str>,
+) -> remuda_core::protocol::Response {
+    use remuda_core::protocol::Response;
+    let denied = || Response::error("session file access denied");
+    if !session_file_enabled(session) {
+        return denied();
+    }
+    let Some(crate::terminal_link::Target::File(url)) = crate::terminal_link::Target::parse(uri)
+    else {
+        return denied();
+    };
+    let Ok(path) = url.to_file_path() else {
+        return denied();
+    };
+    let Ok(mut file) = crate::workdir_read::open(root, &path) else {
+        return denied();
+    };
+    match drive::read_regular_chunk(&mut file, offset, revision) {
+        Ok(chunk) => match serde_json::to_string(&chunk) {
+            Ok(value) => Response::Value(value),
+            Err(_) => Response::error("session file response unavailable"),
+        },
+        Err(DriveReadError::Changed) => Response::error("session file changed"),
+        Err(_) => Response::error("session file unavailable"),
+    }
+}
+
+fn session_file_enabled(session: &str) -> bool {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Policy {
+        #[serde(default = "default_enabled")]
+        enabled: bool,
+        #[serde(default)]
+        denied_sessions: Vec<String>,
+    }
+    fn default_enabled() -> bool {
+        true
+    }
+    let Ok(config) =
+        crate::storage::resolve_dir_for("config", cfg!(windows), &|name| std::env::var_os(name))
+    else {
+        return false;
+    };
+    let path = config.join("session-file-policy.json");
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) => return error.kind() == io::ErrorKind::NotFound,
+    };
+    const MAX_POLICY_BYTES: usize = 64 * 1024;
+    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+        return false;
+    }
+    let mut data = Vec::new();
+    file.take((MAX_POLICY_BYTES + 1) as u64)
+        .read_to_end(&mut data)
+        .is_ok()
+        && data.len() <= MAX_POLICY_BYTES
+        && serde_json::from_slice::<Policy>(&data).is_ok_and(|policy| {
+            policy.enabled && !policy.denied_sessions.iter().any(|name| name == session)
+        })
+}
+
+pub fn read_cluster_session_file(
+    fingerprint: &str,
+    session: &str,
+    instance: &str,
+    uri: &str,
+) -> Result<Vec<u8>, DriveReadError> {
+    use crate::cluster_api::{resolve_call, ResolvedCall};
+    let ResolvedCall::Remote {
+        fingerprint: peer,
+        address,
+        pinned_static_key,
+    } = resolve_call(fingerprint, None).map_err(|_| DriveReadError::Denied)?
+    else {
+        return Err(DriveReadError::Denied);
+    };
+    if peer != fingerprint {
+        return Err(DriveReadError::Denied);
+    }
+    let private =
+        crate::cluster::identity::load_static_private_key().map_err(|_| DriveReadError::Denied)?;
+    let client = ClusterClient::system().with_request_timeout(Duration::from_secs(3));
+    read_session_file_using(session, instance, uri, |request| {
+        client.request(address, &pinned_static_key, &private, &request)
+    })
+}
+
+/// Read a bounded, consistent source file over an already authenticated connection.
+pub fn read_session_file_using<E>(
+    session: &str,
+    instance: &str,
+    uri: &str,
+    mut request_response: impl FnMut(
+        remuda_core::protocol::Request,
+    ) -> Result<remuda_core::protocol::Response, E>,
+) -> Result<Vec<u8>, DriveReadError> {
+    use remuda_core::protocol::{Request, Response};
+    drive::transfer_cluster_source(|offset, revision| {
+        let request = Request::ReadSessionFile {
+            name: session.to_owned(),
+            instance_id: instance.to_owned(),
+            uri: uri.to_owned(),
+            offset,
+            revision: revision.map(str::to_owned),
+        };
+        let response = request_response(request).map_err(|_| ClientError::BadResponse)?;
+        match response {
+            Response::Value(data) => serde_json::from_str(&data)
+                .map(Reply::Chunk)
+                .map_err(|_| ClientError::BadResponse),
+            Response::Error(reason) if reason == "session file changed" => {
+                Ok(Reply::DocumentChanged)
+            }
+            Response::Error(reason) if reason == "session file access denied" => Ok(Reply::Denied),
+            _ => Ok(Reply::ReadFailed),
+        }
     })
 }
 
@@ -529,6 +724,8 @@ mod drive_role_tests {
             drive: DriveGrant::new(None, Some("remuda:///fixture")).unwrap(),
             route_to: None,
             relay_publisher: Some(relay_publisher.clone()),
+            session_publish: true,
+            node: encoding::fingerprint(&[4; 32]),
             delivery: Mutex::new(Delivery::default()),
         };
         for (peer, admitted) in [(&publisher, false), (&relay_publisher, true)] {

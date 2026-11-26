@@ -4470,26 +4470,31 @@ impl Drop for FileMouseCapture {
 }
 
 struct LinkedFilePreview {
-    result: mpsc::Receiver<Result<String, &'static str>>,
-    content: Option<Result<String, &'static str>>,
+    result: mpsc::Receiver<Result<String, String>>,
+    content: Option<Result<String, String>>,
     offset: usize,
 }
 
 impl LinkedFilePreview {
-    fn load(node: String, uri: String, loading: Arc<AtomicBool>) -> Option<Self> {
+    fn load(
+        node: String,
+        session: String,
+        instance: String,
+        uri: String,
+        loading: Arc<AtomicBool>,
+    ) -> Option<Self> {
         if loading.swap(true, Ordering::AcqRel) {
             return None;
         }
         let (send, result) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
-            let content = crate::net::browser::read_cluster_source(&node, &uri)
-                .map_err(|_| {
-                    "The source node did not provide this file. Check its grant and connection."
-                })
-                .and_then(|bytes| {
-                    String::from_utf8(bytes)
-                        .map_err(|_| "This file needs a graphical document viewer.")
-                });
+            let content =
+                crate::net::browser::read_cluster_session_file(&node, &session, &instance, &uri)
+                    .map_err(|error| error.to_string())
+                    .and_then(|bytes| {
+                        String::from_utf8(bytes)
+                            .map_err(|_| "This file needs a graphical document viewer.".to_owned())
+                    });
             let _ = send.send(content);
             loading.store(false, Ordering::Release);
         });
@@ -4550,6 +4555,10 @@ fn is_file_link(cell: &vt100::Cell) -> bool {
     })
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one event loop owns terminal focus, previews, and input routing"
+)]
 fn run_loop(
     path: &Path,
     node: &str,
@@ -4692,12 +4701,21 @@ fn run_loop(
                         if let (
                             Some((pressed, uri, origin)),
                             Some(target),
-                            Some(current @ RemoteSelection::Session { node, .. }),
+                            Some(
+                                current @ RemoteSelection::Session {
+                                    node,
+                                    wire_name,
+                                    instance_id,
+                                    ..
+                                },
+                            ),
                         ) = (link_press.take(), link, &ui.remote_active)
                         {
                             if pressed == point && uri == target && &origin == current {
                                 file_preview = LinkedFilePreview::load(
                                     node.clone(),
+                                    wire_name.clone(),
+                                    instance_id.clone(),
                                     uri,
                                     file_loading.clone(),
                                 );

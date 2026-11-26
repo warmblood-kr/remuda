@@ -579,6 +579,33 @@ fn hosted_and_local_sessions_share_one_registry_name_space() {
     assert!(registry.hosted("fixture").is_some());
 }
 #[test]
+fn launch_workdir_belongs_to_the_live_session_instance() {
+    let registry = crate::Registry::new();
+    let root = std::env::temp_dir();
+    let local = scripted("fixture").with_launch_workdir(Some(root.clone()));
+    let local_instance = local.instance_id().to_owned();
+    registry.register(local).unwrap();
+    assert_eq!(
+        registry.launch_workdir("fixture", &local_instance),
+        Some(root.clone())
+    );
+    assert_eq!(registry.launch_workdir("fixture", "stale"), None);
+    assert!(registry.remove("fixture").is_some());
+
+    let shared = Shared::new();
+    let hosted = handle(&shared).with_launch_workdir(Some(root.clone()));
+    let hosted_instance = hosted.identity().instance.clone();
+    assert!(registry.register_hosted(hosted).is_ok());
+    assert_eq!(registry.launch_workdir("fixture", &local_instance), None);
+    assert_eq!(
+        registry.launch_workdir("fixture", &hosted_instance),
+        Some(root)
+    );
+    shared.exited.store(true, Ordering::Relaxed);
+    assert_eq!(registry.launch_workdir("fixture", &hosted_instance), None);
+}
+
+#[test]
 fn legacy_hosted_launch_opt_out_is_ignored() {
     let registry = crate::Registry::new();
     let registered = handle(&Shared::new());

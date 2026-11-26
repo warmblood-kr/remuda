@@ -870,17 +870,23 @@ impl Render for LocalGui {
         };
         let docs = self.documents.clone();
         let file_origin = match (&self.ssh, self.selection.as_ref()) {
-            (None, Some(selection)) => selection
-                .peer
-                .as_ref()
-                .map_or(browser::FileLinkOrigin::Local, |peer| {
-                    browser::FileLinkOrigin::ClusterPeer(peer.clone())
-                }),
-            (Some(ssh), Some(_)) => ssh
-                .source_node()
-                .map_or(browser::FileLinkOrigin::Unavailable, |node| {
-                    browser::FileLinkOrigin::BrowserPeer(node.to_owned())
-                }),
+            (None, Some(selection)) => {
+                selection
+                    .peer
+                    .as_ref()
+                    .map_or(browser::FileLinkOrigin::Local, |peer| {
+                        browser::FileLinkOrigin::ClusterPeer {
+                            peer: peer.clone(),
+                            session: selection.name.clone(),
+                            instance: selection.instance.clone(),
+                        }
+                    })
+            }
+            (Some(ssh), Some(selection)) => browser::FileLinkOrigin::BrowserPeer {
+                workspace: ssh.clone(),
+                session: selection.name.clone(),
+                instance: selection.instance.clone(),
+            },
             _ => browser::FileLinkOrigin::Unavailable,
         };
         let open_terminal_link = docs

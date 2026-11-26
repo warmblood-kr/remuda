@@ -1625,9 +1625,11 @@ fn open_workspace(
                     let live_focus = cx.focus_handle();
                     gui.live_focus = Some(live_focus.clone());
                     if let Some((connection, client)) = external {
-                        gui.ssh = Some(connection);
+                        gui.ssh = Some(connection.clone());
                         gui.documents =
-                            Some(cx.new(|cx| browser::Browser::ssh(client, live_focus, cx)));
+                            Some(cx.new(|cx| {
+                                browser::Browser::ssh(connection, client, live_focus, cx)
+                            }));
                     } else {
                         let client = match remuda_native::net::browser::Client::from_env() {
                             Ok(client) => client,

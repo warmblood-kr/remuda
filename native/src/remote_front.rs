@@ -221,6 +221,7 @@ fn serve_workspace_stream(
                     scrollback: 0..=10_000,
                     ..
                 }
+                | Request::ReadSessionFile { .. }
                 | Request::ResizeSession { .. }
                 | Request::Input { .. }
                 | Request::RemoteInputLine { .. } => dispatch(request).map_err(str::to_owned),
@@ -390,6 +391,7 @@ pub fn authorize(request: &Request) -> Result<(), String> {
         | Request::RenderedSessionList { width: 1..=512 }
         | Request::RemoteInputSupport
         | Request::CaptureStyled { .. }
+        | Request::ReadSessionFile { .. }
         | Request::Sync { .. } => Ok(()),
         Request::Input {
             client_id,
@@ -428,6 +430,7 @@ pub fn authorize(request: &Request) -> Result<(), String> {
         Request::SetRemoteInputOptOut { .. } => Err(refusal("SetRemoteInputOptOut")),
         Request::SetSessionTeam { .. } => Err(refusal("SetSessionTeam")),
         Request::New { .. } => Err(refusal("New")),
+        Request::BrowserPublishDocument { .. } => Err(refusal("BrowserPublishDocument")),
         Request::NewWithInstance { .. } => Err(refusal("NewWithInstance")),
         Request::SendLine { .. } => Err(refusal("SendLine")),
         Request::ClearInput { .. } => Err(refusal("ClearInput")),

@@ -716,6 +716,35 @@ mod platform {
         }
     }
 
+    // SYNCHRONIZE | READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_TRAVERSE | FILE_LIST_DIRECTORY
+    pub(crate) const WORKDIR_DIRECTORY_ACCESS: u32 = 0x0012_00A1;
+
+    pub(crate) fn open_workdir_component(
+        parent: &std::fs::File,
+        component: &std::ffi::OsStr,
+        directory: bool,
+    ) -> io::Result<std::fs::File> {
+        use std::os::windows::ffi::OsStrExt;
+
+        let mut name: Vec<u16> = component.encode_wide().collect();
+        if name.is_empty()
+            || name.len() > 255
+            || name == [u16::from(b'.')]
+            || name == [u16::from(b'.'), u16::from(b'.')]
+            || name.iter().any(|&unit| matches!(unit, 0 | 47 | 58 | 92))
+        {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        name.push(0);
+        let access = if directory {
+            WORKDIR_DIRECTORY_ACCESS
+        } else {
+            // SYNCHRONIZE | READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_READ_DATA
+            0x0012_0081
+        };
+        open_relative_utf16(parent, &name, directory, false, access, ptr::null_mut())
+    }
+
     fn open_relative(
         parent: &std::fs::File,
         component: &str,
@@ -743,10 +772,28 @@ mod platform {
     ) -> io::Result<std::fs::File> {
         let name = relative_component_utf16(component)
             .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
-        let length = ((name.len() - 1) * std::mem::size_of::<u16>()) as u16;
+        open_relative_utf16(
+            parent,
+            &name,
+            directory,
+            create,
+            access,
+            security_descriptor,
+        )
+    }
+
+    fn open_relative_utf16(
+        parent: &std::fs::File,
+        name: &[u16],
+        directory: bool,
+        create: bool,
+        access: u32,
+        security_descriptor: *mut c_void,
+    ) -> io::Result<std::fs::File> {
+        let length = std::mem::size_of_val(&name[..name.len() - 1]) as u16;
         let mut unicode = UNICODE_STRING {
             Length: length,
-            MaximumLength: (name.len() * std::mem::size_of::<u16>()) as u16,
+            MaximumLength: std::mem::size_of_val(name) as u16,
             Buffer: name.as_ptr().cast_mut(),
         };
         let policy = nt_open_policy(directory);
@@ -1362,7 +1409,8 @@ mod platform {
 
 #[cfg(windows)]
 pub(crate) use platform::{
-    create_private_root, ensure_storage_root, verify_private_root, StorageDirectory,
+    create_private_root, ensure_storage_root, open_workdir_component, verify_private_root,
+    StorageDirectory, WORKDIR_DIRECTORY_ACCESS,
 };
 
 #[cfg(all(windows, test))]

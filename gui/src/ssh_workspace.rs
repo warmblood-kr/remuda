@@ -205,7 +205,7 @@ impl SshWorkspace {
         Ok(screen)
     }
 
-    fn request(&self, request: &Request) -> io::Result<Response> {
+    pub(crate) fn request(&self, request: &Request) -> io::Result<Response> {
         self.dispatch(request, None)
     }
 

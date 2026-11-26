@@ -373,6 +373,10 @@ fn call_response(id: Value, response: Response) -> String {
                 "applied"
             }),
         ),
+        Response::BrowserDocumentPublished { .. } => ok_reply(
+            id,
+            tool_error("Browser publication is not exposed over MCP"),
+        ),
         Response::ClusterRegistryPage { .. }
         | Response::ClusterRegistryAck { .. }
         | Response::ClusterVfsIndexPage { .. }

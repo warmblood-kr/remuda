@@ -302,3 +302,28 @@ source prefixes plus a member whose pre-auth read exceeds 250 ms can still
 evict that member, which retries. IPv4 prefixes are /32, so an exposed public
 listener would make that residual internet-reachable; auto mode never binds
 the wildcard. Joins still require the one-time token described in #332.
+
+
+## Session workdir file links
+
+An admitted cluster node or an authenticated Remuda Browser SSH workspace can
+read a regular file underneath a live session's recorded launch directory.
+The source daemon checks the session name and instance ID for each read. A
+directory selected inside the running shell does not change the recorded
+directory. Symlinks, Windows reparse points, hardlinked files, and paths outside
+the recorded directory are rejected. A remote preview is limited to 1 MiB.
+Sessions that predate workdir recording, or that were started without an
+explicit workdir, need a new launch with an explicit workdir before they can
+serve file links.
+
+To turn off the default on a source node, set `{"enabled":false}` in
+`session-file-policy.json` in the Remuda config directory. To block only some
+sessions on that node, set `{"denied_sessions":["session-name"]}`. The usual
+config directory is `~/.config/remuda` on macOS and Linux, and
+`%LOCALAPPDATA%\remuda\config` on Windows. XDG overrides apply. Save the new
+policy atomically. The next read uses it without a daemon restart. The
+policy cannot revoke a copy already received by a viewer.
+
+Use `remuda browser link 'file:///absolute/path/report.md' 'Report'` to emit
+a terminal hyperlink. The viewer requests it from the source of the selected
+session. Existing explicit Drive grants continue to use `remuda:///` links.

@@ -243,6 +243,7 @@ enum Backend {
 /// The legacy Registry map keeps Session; `Registry::register_hosted` takes this.
 pub struct SessionHandle {
     identity: Identity,
+    launch_workdir: Option<std::path::PathBuf>,
     input_owner: Option<[u8; 16]>,
     policy_update: std::sync::Mutex<()>,
     backend: Backend,
@@ -251,6 +252,7 @@ impl SessionHandle {
     pub fn local(session: Arc<Session>) -> Self {
         Self {
             identity: Identity::local(&session),
+            launch_workdir: session.launch_workdir().map(std::path::Path::to_path_buf),
             input_owner: None,
             policy_update: std::sync::Mutex::new(()),
             backend: Backend::Local(session),
@@ -271,11 +273,22 @@ impl SessionHandle {
         );
         Ok(Self {
             identity,
+            launch_workdir: None,
             input_owner,
             policy_update: std::sync::Mutex::new(()),
             backend: Backend::Remote(backend),
         })
     }
+    /// Record the canonical launch directory from the checked host inventory.
+    pub fn with_launch_workdir(mut self, workdir: Option<std::path::PathBuf>) -> Self {
+        self.launch_workdir = workdir.filter(|path| path.is_absolute());
+        self
+    }
+
+    pub(crate) fn launch_workdir(&self) -> Option<&std::path::Path> {
+        self.launch_workdir.as_deref()
+    }
+
     pub fn identity(&self) -> &Identity {
         &self.identity
     }

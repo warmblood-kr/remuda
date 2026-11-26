@@ -476,6 +476,7 @@ impl Hosting {
                 std::thread::spawn(move || hosts.teardown(&name, session, TEARDOWN_DEADLINE));
                 continue;
             }
+            let workdir = session.launch_workdir();
             let Ok(handle) = SessionHandle::hosted(session) else {
                 continue;
             };
@@ -491,7 +492,10 @@ impl Hosting {
             }
             let disabled = super::recovery::remote_input_disabled(entry);
             if registry
-                .register_hosted_with_remote_input_disabled(handle, disabled)
+                .register_hosted_with_remote_input_disabled(
+                    handle.with_launch_workdir(workdir),
+                    disabled,
+                )
                 .is_ok()
             {
                 names.push(name.clone());
@@ -507,7 +511,10 @@ impl Hosting {
             .map_err(|error| error.to_string())?
             .ok_or("session host inventory unavailable")?;
         let session = hosts.spawn(request)?;
-        let handle = SessionHandle::hosted(session.clone()).map_err(|error| error.to_string())?;
+        let workdir = session.launch_workdir();
+        let handle = SessionHandle::hosted(session)
+            .map_err(|error| error.to_string())?
+            .with_launch_workdir(workdir);
         registry
             .register_hosted_with_remote_input_disabled(handle, request.remote_input_disabled)
             .map(|_| ())
@@ -790,7 +797,13 @@ impl Hosts {
 
     fn spawn(self: &Arc<Self>, request: &NewHosted<'_>) -> Result<Arc<HostSession>, String> {
         let _pass = self.gate.enter().map_err(|error| error.to_string())?;
-        let launch = launch(request)?;
+        let mut launch = launch(request)?;
+        let launch_workdir = crate::daemon::explicit_launch_workdir(request.cwd)
+            .and_then(|path| path.into_os_string().into_string().ok())
+            .filter(|path| path.len() <= 1024);
+        if let Some(workdir) = &launch_workdir {
+            launch.cwd.clone_from(workdir);
+        }
         // Checked before the durable reservation, which a missing binary
         // would otherwise leave behind under this name.
         let exe = host_executable()?;
@@ -818,7 +831,7 @@ impl Hosts {
             .to_owned();
         let mut entry = Entry::reserved(identity.clone(), launch_id, &raw)
             .map_err(|error| format!("session host launch: {error:?}"))?;
-        set_launch_remote_policy(&mut entry, request.remote_input_disabled)?;
+        set_launch_metadata(&mut entry, request.remote_input_disabled, launch_workdir)?;
         entry.birth = Some(
             Birth::new(endpoint_text, nonce)
                 .map_err(|error| format!("session host birth: {error:?}"))?,
@@ -968,17 +981,38 @@ impl Hosts {
         }
     }
 }
-/// True once a registered host takes input. A host that cannot be asked
-/// counts as accepting: the request that follows reports what is wrong.
-fn set_launch_remote_policy(entry: &mut Entry, disabled: bool) -> Result<(), String> {
-    let value = super::inventory::model::Namespace::new(1, if disabled { "true" } else { "false" })
-        .map_err(|error| format!("session host policy: {error:?}"))?;
+fn set_launch_metadata(
+    entry: &mut Entry,
+    remote_input_disabled: bool,
+    workdir: Option<String>,
+) -> Result<(), String> {
+    use super::inventory::model::Namespace;
+
+    let input_policy = Namespace::new(
+        1,
+        if remote_input_disabled {
+            "true"
+        } else {
+            "false"
+        },
+    )
+    .map_err(|error| format!("session host policy: {error:?}"))?;
     entry
         .metadata
-        .insert(super::recovery::REMOTE_INPUT_POLICY.into(), value);
+        .insert(super::recovery::REMOTE_INPUT_POLICY.into(), input_policy);
+    if let Some(workdir) = workdir {
+        let payload = serde_json::to_string(&workdir).map_err(|error| error.to_string())?;
+        let value = Namespace::new(1, &payload)
+            .map_err(|error| format!("session host workdir: {error:?}"))?;
+        entry
+            .metadata
+            .insert(super::recovery::LAUNCH_WORKDIR.into(), value);
+    }
     Ok(())
 }
 
+/// True once a registered host takes input. A host that cannot be asked
+/// counts as accepting: the request that follows reports what is wrong.
 fn accepting(entry: &Entry) -> bool {
     use super::api::{PublicationStatus, Request, Response};
     let Some(birth) = entry.birth.as_ref() else {

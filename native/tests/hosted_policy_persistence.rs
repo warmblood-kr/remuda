@@ -83,3 +83,65 @@ fn wrong_instance_cannot_change_policy_and_name_reuse_starts_fresh() {
     assert_ne!(set(&daemon, "guarded", &old, true), Response::Ok);
     assert!(!disabled(&daemon, "guarded", &new));
 }
+
+#[test]
+fn session_file_scope_stays_bound_to_the_launch_across_daemon_restart() {
+    use base64::Engine as _;
+
+    let mut daemon = Parity::start(Mode::Hosted);
+    let workdir = daemon.root().join("project");
+    std::fs::create_dir(&workdir).unwrap();
+    let document = workdir.join("result.md");
+    std::fs::write(&document, b"# Result").unwrap();
+    let uri = url::Url::from_file_path(&document).unwrap().to_string();
+
+    let launch = |daemon: &Parity, name: &str, cwd: Option<String>| match daemon.request(
+        &Request::NewWithInstance {
+            name: Some(name.into()),
+            command: vec!["/bin/sh".into()],
+            size: Size::new(80, 24),
+            cwd,
+            env: None,
+            remote_input_disabled: false,
+        },
+    ) {
+        Response::SessionStarted { instance_id, .. } => instance_id,
+        other => panic!("unexpected launch: {other:?}"),
+    };
+    let read = |daemon: &Parity, name: &str, instance_id: &str| {
+        daemon.request(&Request::ReadSessionFile {
+            name: name.into(),
+            instance_id: instance_id.into(),
+            uri: uri.clone(),
+            offset: 0,
+            revision: None,
+        })
+    };
+    let assert_reads_workdir = |daemon: &Parity, instance: &str| {
+        let Response::Value(chunk) = read(daemon, "project", instance) else {
+            panic!("live project instance must retain its workdir");
+        };
+        let chunk: serde_json::Value = serde_json::from_str(&chunk).unwrap();
+        let data = chunk["data_b64"].as_str().unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .unwrap(),
+            b"# Result"
+        );
+    };
+    let instance = launch(&daemon, "project", Some(workdir.to_str().unwrap().into()));
+    let implicit = launch(&daemon, "implicit", None);
+    assert_reads_workdir(&daemon, &instance);
+    daemon.kill_daemon();
+    daemon.restart();
+    assert_reads_workdir(&daemon, &instance);
+    assert!(matches!(
+        read(&daemon, "project", "wrong-instance"),
+        Response::Error(_)
+    ));
+    assert!(matches!(
+        read(&daemon, "implicit", &implicit),
+        Response::Error(_)
+    ));
+}
