@@ -42,6 +42,10 @@ pub enum Operation {
     RelayPublish {
         request: DocumentRequest,
     },
+    /// Older relays must fail closed before dropping a session's provenance.
+    RelaySessionPublish {
+        request: DocumentRequest,
+    },
     Poll {
         instance: String,
     },
@@ -341,15 +345,22 @@ impl Service {
             Operation::RelayPublish { request }
                 if admitted
                     && self.relay_publisher.as_deref() == Some(peer)
+                    && request.origin.is_none()
                     && valid_id(&request.id)
-                    && match &request.origin {
-                        Some(origin) => {
-                            self.session_publish
-                                && origin.node == encoding::fingerprint(peer)
-                                && self.authorizes_session_document(&request.uri)
-                        }
-                        None => self.drive.authorizes_document(&request.uri),
-                    } =>
+                    && self.drive.authorizes_document(&request.uri) =>
+            {
+                Reply::Outcome(delivery.publish(request, now))
+            }
+            Operation::RelaySessionPublish { request }
+                if admitted
+                    && self.relay_publisher.as_deref() == Some(peer)
+                    && self.session_publish
+                    && valid_id(&request.id)
+                    && request
+                        .origin
+                        .as_ref()
+                        .is_some_and(|origin| origin.node == encoding::fingerprint(peer))
+                    && self.authorizes_session_document(&request.uri) =>
             {
                 Reply::Outcome(delivery.publish(request, now))
             }
@@ -406,8 +417,14 @@ fn relay(target: &str, request: DocumentRequest) -> Reply {
         server: pinned_static_key,
         private,
     };
-    match client.send_with_timeout(&Operation::RelayPublish { request }, Duration::from_secs(2)) {
+    let operation = if request.origin.is_some() {
+        Operation::RelaySessionPublish { request }
+    } else {
+        Operation::RelayPublish { request }
+    };
+    match client.send_with_timeout(&operation, Duration::from_secs(2)) {
         Ok(reply @ (Reply::Outcome(_) | Reply::Denied)) => reply,
+        Ok(Reply::Invalid) => Reply::Denied,
         _ => Reply::Outcome(Outcome::Unknown),
     }
 }
