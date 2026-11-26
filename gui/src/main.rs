@@ -14,6 +14,7 @@ mod browser;
 mod browser_media;
 mod clipboard_image;
 mod cluster_status;
+mod document_split;
 #[allow(dead_code)]
 mod input_helper;
 mod line_input;
@@ -392,6 +393,7 @@ struct LocalGui {
     show_help: bool,
     sidebar_width: f32,
     resize_start: Option<(f32, f32)>,
+    document_split: document_split::DocumentSplit,
     node_status: Option<cluster_status::ClusterStatus>,
     selected_node_status: NodeMetricsStatus,
     node_details_requested: bool,
@@ -467,6 +469,7 @@ impl LocalGui {
             show_help: false,
             sidebar_width: 266.,
             resize_start: None,
+            document_split: Default::default(),
             node_status: None,
             selected_node_status: NodeMetricsStatus::default(),
             node_details_requested: false,
@@ -1827,8 +1830,42 @@ mod tests {
         cx.simulate_resize(gpui::size(px(1120.), px(720.)));
         let split = cx.debug_bounds("local-split-tab").unwrap();
         cx.simulate_click(split.center(), gpui::Modifiers::none());
-        assert!(cx.debug_bounds("browser-document-body").is_some());
-        assert!(cx.debug_bounds("session-pane").is_some());
+        let divider = cx.debug_bounds("document-split-divider").unwrap();
+        let document = cx.debug_bounds("browser-document-body").unwrap();
+        let terminal_pane = cx.debug_bounds("session-pane").unwrap();
+        let start = divider.center();
+        let end = gpui::point(start.x - px(80.), start.y);
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Left,
+            position: start,
+            ..Default::default()
+        });
+        cx.simulate_event(gpui::MouseMoveEvent {
+            pressed_button: Some(gpui::MouseButton::Left),
+            position: end,
+            ..Default::default()
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            button: gpui::MouseButton::Left,
+            position: end,
+            ..Default::default()
+        });
+        let resized = cx.debug_bounds("browser-document-body").unwrap();
+        assert_eq!(resized.size.width, document.size.width + px(80.));
+        assert_eq!(
+            cx.debug_bounds("session-pane").unwrap().size.width,
+            terminal_pane.size.width - px(80.)
+        );
+        cx.simulate_event(gpui::MouseMoveEvent {
+            pressed_button: Some(gpui::MouseButton::Left),
+            position: gpui::point(end.x + px(40.), end.y),
+            ..Default::default()
+        });
+        assert_eq!(cx.debug_bounds("browser-document-body").unwrap(), resized);
+        cx.simulate_resize(gpui::size(px(1119.), px(720.)));
+        assert!(cx.debug_bounds("document-split-divider").is_none());
+        cx.simulate_resize(gpui::size(px(1120.), px(720.)));
+        assert_eq!(cx.debug_bounds("browser-document-body").unwrap(), resized);
         let terminal = cx.debug_bounds("local-terminal-tab").unwrap();
         cx.simulate_click(terminal.center(), gpui::Modifiers::none());
         assert!(cx.debug_bounds("browser-document-body").is_none());

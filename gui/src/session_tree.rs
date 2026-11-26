@@ -889,14 +889,22 @@ impl Render for LocalGui {
             None
         };
         let pane_width = if narrow { width } else { width - sidebar - 5. };
-        let document_width = if split { pane_width / 2. } else { pane_width };
+        let (terminal_width, document_width) = if split {
+            self.document_split.widths(pane_width)
+        } else {
+            self.document_split.stop();
+            (pane_width, pane_width)
+        };
         let node_panel = (!self.drive_selected && !document_selected)
             .then(|| self.selected_node_panel(width < 360., cx))
             .flatten();
         let showing_node = node_panel.is_some();
         let document = if split || document_selected {
-            docs.as_ref()
-                .map(|docs| docs.update(cx, |docs, cx| docs.document_panel(document_width, cx)))
+            docs.as_ref().map(|docs| {
+                docs.update(cx, |docs, cx| {
+                    docs.document_panel(document_width, self.document_split.dragging(), cx)
+                })
+            })
         } else {
             if let Some(docs) = &docs {
                 docs.update(cx, |docs, cx| docs.hide_native_document(cx));
@@ -985,7 +993,10 @@ impl Render for LocalGui {
             .on_key_down(|event, window, cx| {
                 crate::workspace_tab_navigation(event, window, cx, false)
             })
-            .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+            .on_mouse_move(cx.listener(move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                if this.document_split.mouse_move(event, pane_width) {
+                    cx.notify();
+                }
                 if let Some((origin, width)) = this.resize_start {
                     if event.pressed_button == Some(MouseButton::Left) {
                         this.sidebar_width = width + f32::from(event.position.x) - origin;
@@ -998,7 +1009,8 @@ impl Render for LocalGui {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    if this.resize_start.take().is_some() {
+                    let document_drag = this.document_split.stop();
+                    if this.resize_start.take().is_some() || document_drag {
                         cx.notify();
                     }
                 }),
@@ -1248,7 +1260,8 @@ impl Render for LocalGui {
                                     div()
                                         .id("session-pane")
                                         .debug_selector(|| "session-pane".into())
-                                        .flex_1()
+                                        .when(split, |pane| pane.w(px(terminal_width)).flex_none())
+                                        .when(!split, |pane| pane.flex_1())
                                         .min_w_0()
                                         .min_h_0()
                                         .flex()
@@ -1389,6 +1402,18 @@ impl Render for LocalGui {
                                                 }),
                                         ),
                                 )
+                            })
+                            .when(split, |d| {
+                                d.child(crate::document_split::DocumentSplit::divider().on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                        this.document_split.start(f32::from(event.position.x), pane_width);
+                                        if let Some(docs) = &this.documents {
+                                            docs.update(cx, |docs, cx| docs.hide_native_document(cx));
+                                        }
+                                        cx.notify();
+                                    }),
+                                ))
                             })
                             .when_some(document, |d, doc| d.child(doc)),
                     ),

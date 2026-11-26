@@ -16,10 +16,10 @@ use std::{
     sync::{mpsc, Arc},
 };
 
-use crate::browser_media;
 #[cfg(any(target_os = "macos", windows))]
 use crate::native_document;
 use crate::terminal_view::{self, Screen, Viewport};
+use crate::{browser_media, document_split::DocumentSplit};
 
 const SPLIT_WIDTH: f32 = 1120.;
 const SIDEBAR_WIDTH: f32 = 208.;
@@ -346,8 +346,7 @@ pub(crate) struct Browser {
     drive_scroll: gpui::ScrollHandle,
     zoom: f32,
     last_input: Option<Instant>,
-    split_fraction: f32,
-    dragging_split: bool,
+    document_split: DocumentSplit,
     terminal: Option<PtyAgent>,
     screen: Screen,
     terminal_scroll: terminal_view::HistoryScroll,
@@ -477,8 +476,7 @@ impl Browser {
             drive_scroll: Default::default(),
             zoom: 1.,
             last_input: None,
-            split_fraction: 0.5,
-            dragging_split: false,
+            document_split: Default::default(),
             terminal,
             screen,
             terminal_scroll: Default::default(),
@@ -1272,7 +1270,17 @@ impl Browser {
         }
     }
 
-    pub(crate) fn document_panel(&mut self, pane_width: f32, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn document_panel(
+        &mut self,
+        pane_width: f32,
+        dragging: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // The OS-owned HTML surface receives pointer events. Hide it while
+        // dragging so the GPUI divider can follow the pointer over the pane.
+        if dragging {
+            self.hide_native_document(cx);
+        }
         let Some(document) = self.document.as_ref() else {
             return div()
                 .flex_1()
@@ -1354,7 +1362,11 @@ impl Browser {
                 },
             ));
             let body = if self.native_html.selected {
-                self.native_panel(cx)
+                if dragging {
+                    div().flex_1().into_any_element()
+                } else {
+                    self.native_panel(cx)
+                }
             } else {
                 fallback()
             };
@@ -1616,10 +1628,11 @@ impl Render for Browser {
                 .is_some_and(|doc| doc.uri == request.uri)
         });
         let available = f32::from(window.viewport_size().width) - SIDEBAR_WIDTH;
-        let document_width = if wide {
-            (available - 5.) * (1. - self.split_fraction)
+        let (terminal_width, document_width) = if wide {
+            self.document_split.widths(available)
         } else {
-            available
+            self.document_split.stop();
+            (available, available)
         };
         let mut content = div()
             .flex()
@@ -1674,9 +1687,7 @@ impl Render for Browser {
             );
         if wide {
             let terminal = self.terminal_panel(cx);
-            let document = self.document_panel(document_width, cx);
-            let width = (f32::from(window.viewport_size().width) - SIDEBAR_WIDTH - 5.)
-                * self.split_fraction;
+            let document = self.document_panel(document_width, self.document_split.dragging(), cx);
             content = content.child(
                 div()
                     .flex()
@@ -1687,28 +1698,27 @@ impl Render for Browser {
                         div()
                             .flex()
                             .min_h_0()
-                            .w(px(width))
+                            .w(px(terminal_width))
                             .flex_none()
                             .child(terminal),
                     )
-                    .child(
-                        div()
-                            .id("browser-split-divider")
-                            .w(px(5.))
-                            .flex_none()
-                            .cursor_col_resize()
-                            .bg(rgb(0x354055))
-                            .on_mouse_down(
-                                gpui::MouseButton::Left,
-                                cx.listener(|this, _, _, _| {
-                                    this.dragging_split = true;
-                                }),
-                            ),
-                    )
+                    .child(DocumentSplit::divider().on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                            this.document_split
+                                .start(f32::from(event.position.x), available);
+                            this.hide_native_document(cx);
+                            cx.notify();
+                        }),
+                    ))
                     .child(document),
             );
         } else if self.active == Content::Document {
-            content = content.child(self.document_panel(document_width, cx));
+            content = content.child(self.document_panel(
+                document_width,
+                self.document_split.dragging(),
+                cx,
+            ));
         } else {
             self.hide_native_document(cx);
             content = content.child(self.terminal_panel(cx));
@@ -1718,27 +1728,18 @@ impl Render for Browser {
             .size_full()
             .text_color(rgb(0x1c2327))
             .on_mouse_move(
-                cx.listener(|this, event: &gpui::MouseMoveEvent, window, cx| {
-                    if !this.dragging_split {
-                        return;
-                    }
-                    if event.pressed_button != Some(gpui::MouseButton::Left) {
-                        this.dragging_split = false;
-                        return;
-                    }
-                    let available = f32::from(window.viewport_size().width) - SIDEBAR_WIDTH;
-                    if available > 0. {
-                        this.split_fraction = ((f32::from(event.position.x) - SIDEBAR_WIDTH)
-                            / available)
-                            .clamp(0.34, 0.66);
+                cx.listener(move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                    if this.document_split.mouse_move(event, available) {
                         cx.notify();
                     }
                 }),
             )
             .on_mouse_up(
                 gpui::MouseButton::Left,
-                cx.listener(|this, _, _, _| {
-                    this.dragging_split = false;
+                cx.listener(|this, _, _, cx| {
+                    if this.document_split.stop() {
+                        cx.notify();
+                    }
                 }),
             )
             // Leave the PTY's plain Tab and Shift+Tab handling intact.
@@ -1875,8 +1876,7 @@ mod tests {
                 drive_scroll: Default::default(),
                 zoom: 1.,
                 last_input: None,
-                split_fraction: 0.5,
-                dragging_split: false,
+                document_split: Default::default(),
                 terminal: None,
                 screen: Screen::default(),
                 terminal_scroll: Default::default(),
