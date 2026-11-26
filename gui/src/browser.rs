@@ -26,6 +26,7 @@ const SIDEBAR_WIDTH: f32 = 208.;
 
 struct Document {
     uri: String,
+    revision: String,
     media: browser_media::Document,
     request: Option<DocumentRequest>,
     #[cfg(any(target_os = "macos", windows))]
@@ -521,15 +522,8 @@ impl Browser {
     #[cfg(test)]
     pub(crate) fn seed_test_document(&mut self, window: &mut Window, cx: &mut App) {
         let uri = "remuda:///pilot/plan.md".to_owned();
-        let media = browser_media::decode("pilot/plan.md", b"# Design plan").unwrap();
         self.open_document(
-            Document {
-                uri,
-                media,
-                request: None,
-                #[cfg(any(target_os = "macos", windows))]
-                html: None,
-            },
+            read(|_| Ok(b"# Design plan".to_vec()), uri, None).unwrap(),
             true,
             window,
             cx,
@@ -714,10 +708,12 @@ impl Browser {
         let request = document.request.take();
         #[cfg(any(target_os = "macos", windows))]
         let native_enabled = self.native_source.is_some();
-        if let Some(index) = self
+        let existing = self
             .document_tabs
             .iter()
-            .position(|tab| tab.document.uri == document.uri)
+            .position(|tab| tab.document.uri == document.uri);
+        if let Some(index) = existing
+            .filter(|&index| self.document_tabs[index].document.revision == document.revision)
         {
             self.switch_document_tab(index, cx);
             let tab = &mut self.document_tabs[index];
@@ -747,8 +743,7 @@ impl Browser {
                     .then(|| Instant::now() + remuda_native::net::browser::DELIVERY_TTL),
                 ..NativeHtml::default()
             };
-            self.document_index = self.document_tabs.len();
-            self.document_tabs.push(DocumentTab {
+            let tab = DocumentTab {
                 generation: self.document_generation,
                 document,
                 pending_presentation: request,
@@ -757,7 +752,14 @@ impl Browser {
                 zoom: 1.,
                 #[cfg(any(target_os = "macos", windows))]
                 native_html,
-            });
+            };
+            self.document_index = existing.unwrap_or(self.document_tabs.len());
+            if let Some(index) = existing {
+                let previous = std::mem::replace(&mut self.document_tabs[index], tab);
+                previous.document.media.release_images(window);
+            } else {
+                self.document_tabs.push(tab);
+            }
         }
         if focus {
             self.active = Content::Document;
@@ -1275,7 +1277,8 @@ impl Browser {
                                             eprintln!("remuda: native document preview: {error}");
                                             tab.native_html.selected = false;
                                             tab.native_html.failed = true;
-                                            tab.pending_presentation = None;
+                                            // The Reader can acknowledge the document after its own paint.
+                                            tab.painted = Default::default();
                                         }
                                     }
                                     cx.notify();
@@ -1442,8 +1445,11 @@ impl Browser {
                     tab.native_html.selected = !tab.native_html.selected;
                     tab.native_html.failed = false;
                     if !tab.native_html.selected {
-                        tab.pending_presentation = None;
                         tab.native_html.hide(cx);
+                    }
+                    if tab.unseen() {
+                        // Invalidate a callback scheduled by the previous renderer.
+                        tab.painted = Default::default();
                     }
                     this.document_focus.focus(window, cx);
                     cx.notify();
@@ -1654,6 +1660,7 @@ fn read(
         .path;
     let bytes = load(&uri)?;
     let media = browser_media::decode(&path, &bytes)?;
+    let revision = remuda_native::cluster::vfs::sha256_hex(&bytes);
     #[cfg(any(target_os = "macos", windows))]
     let html = path
         .rsplit_once('.')
@@ -1663,6 +1670,7 @@ fn read(
         .then(|| Arc::from(bytes));
     Ok(Document {
         uri,
+        revision,
         media,
         request,
         #[cfg(any(target_os = "macos", windows))]
@@ -1936,14 +1944,12 @@ mod tests {
     }
 
     fn document(request: Option<DocumentRequest>) -> Document {
-        Document {
-            uri: "remuda:///pilot/plan.md".into(),
-            media: browser_media::decode("pilot/plan.md", b"# Design plan\n\nMake it readable.")
-                .unwrap(),
+        read(
+            |_| Ok(b"# Design plan\n\nMake it readable.".to_vec()),
+            "remuda:///pilot/plan.md".into(),
             request,
-            #[cfg(any(target_os = "macos", windows))]
-            html: None,
-        }
+        )
+        .unwrap()
     }
 
     #[gpui::test]
@@ -2105,22 +2111,23 @@ mod tests {
             assert_eq!(browser.document_tab().unwrap().document.uri, request.uri);
             cx.notify();
         });
-        let document = cx.debug_bounds("browser-document-body").unwrap();
-        assert!(document.size.width > px(1000.), "{document:?}");
+        let document_bounds = cx.debug_bounds("browser-document-body").unwrap();
+        assert!(
+            document_bounds.size.width > px(1000.),
+            "{document_bounds:?}"
+        );
 
         view.update_in(cx, |browser, window, cx| {
             let markdown = (0..90)
                 .map(|line| format!("Paragraph {line}\n\n"))
                 .collect::<String>();
-            let media = browser_media::decode("pilot/long.md", markdown.as_bytes()).unwrap();
             browser.open_document(
-                Document {
-                    uri: "remuda:///pilot/long.md".into(),
-                    media,
-                    request: None,
-                    #[cfg(any(target_os = "macos", windows))]
-                    html: None,
-                },
+                read(
+                    |_| Ok(markdown.into_bytes()),
+                    "remuda:///pilot/long.md".into(),
+                    None,
+                )
+                .unwrap(),
                 true,
                 window,
                 cx,
@@ -2218,13 +2225,12 @@ mod tests {
         image.write_to(&mut png, image::ImageFormat::Png).unwrap();
         view.update_in(cx, |browser, window, cx| {
             browser.open_document(
-                Document {
-                    uri: "remuda:///pilot/image.png".into(),
-                    media: browser_media::decode("pilot/image.png", png.get_ref()).unwrap(),
-                    request: None,
-                    #[cfg(any(target_os = "macos", windows))]
-                    html: None,
-                },
+                read(
+                    |_| Ok(png.into_inner()),
+                    "remuda:///pilot/image.png".into(),
+                    None,
+                )
+                .unwrap(),
                 true,
                 window,
                 cx,
@@ -2280,5 +2286,31 @@ mod tests {
         view.update_in(cx, |browser, window, _| {
             assert!(browser.focus.is_focused(window))
         });
+
+        let update = DocumentRequest {
+            id: "updated-plan".into(),
+            uri: request.uri.clone(),
+        };
+        view.update_in(cx, |browser, window, cx| {
+            browser.open_document(document(None), true, window, cx);
+            let first = browser.document_tab().unwrap();
+            let generation = first.generation;
+            let painted = first.painted.clone();
+            let refreshed = read(
+                |_| Ok(b"# Revised plan\n\nNew content.".to_vec()),
+                update.uri.clone(),
+                Some(update.clone()),
+            )
+            .unwrap();
+            browser.open_document(refreshed, true, window, cx);
+            browser.acknowledge_document(generation, &painted);
+            assert!(receipt.try_recv().is_err());
+            assert_eq!(browser.document_tabs.len(), 1);
+            let current = browser.document_tab().unwrap();
+            assert_ne!(current.generation, generation);
+            assert_eq!(current.document.media.title, "Revised plan");
+            cx.notify();
+        });
+        assert_eq!(receipt.try_recv().ok(), Some(update));
     }
 }
