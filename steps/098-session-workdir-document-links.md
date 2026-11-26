@@ -24,10 +24,12 @@ session identity.
 ```text
 test remote_tui_click_opens_new_session_workdir_file_then_honors_opt_out ... ok
 test workdir_document_publication_reaches_the_browser_with_its_verified_origin ... ok
+test daemonless_gui_opens_workdir_document_with_one_tab_and_returns_receipt ... ok
 test result: ok. 72 passed; 0 failed; 7 ignored; 0 measured; 0 filtered out; finished in 8.12s
 ```
 
 The first test uses real isolated daemons, a terminal UI and the fixed SSH
 workspace command over test stdio. The second drives real listeners with a
-Browser protocol client. The GUI test suite renders using GPUI's test
-platform. Windows GNU GUI binaries and tests were compile-checked on macOS.
+Browser protocol client. The third test uses the real fixed workspace command through an SSH shim and
+paints one tab on GPUI's test platform. Windows GNU GUI binaries and tests
+were compile-checked on macOS.

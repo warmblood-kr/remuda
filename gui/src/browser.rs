@@ -26,6 +26,7 @@ const SIDEBAR_WIDTH: f32 = 208.;
 
 struct Document {
     uri: String,
+    source_node: Option<String>,
     revision: String,
     media: browser_media::Document,
     request: Option<DocumentRequest>,
@@ -80,6 +81,7 @@ pub(crate) enum FileLinkOrigin {
         instance: String,
     },
     LocalSession {
+        node: String,
         session: String,
         instance: String,
     },
@@ -759,10 +761,9 @@ impl Browser {
         let request = document.request.take();
         #[cfg(any(target_os = "macos", windows))]
         let native_enabled = self.native_source.is_some();
-        let existing = self
-            .document_tabs
-            .iter()
-            .position(|tab| tab.document.uri == document.uri);
+        let existing = self.document_tabs.iter().position(|tab| {
+            tab.document.uri == document.uri && tab.document.source_node == document.source_node
+        });
         if let Some(index) = existing
             .filter(|&index| self.document_tabs[index].document.revision == document.revision)
         {
@@ -1377,11 +1378,15 @@ impl Browser {
         else {
             return;
         };
-        if let Some(request) = tab
-            .pending_presentation
-            .as_ref()
-            .filter(|r| r.uri == tab.document.uri)
-        {
+        if let Some(request) = tab.pending_presentation.as_ref().filter(|request| {
+            request.uri == tab.document.uri
+                && tab.document.source_node.as_ref().is_none_or(|node| {
+                    request
+                        .origin
+                        .as_ref()
+                        .is_some_and(|origin| &origin.node == node)
+                })
+        }) {
             if !painted.replace(true) {
                 let _ = self.displayed.send(request.clone());
             }
@@ -1702,7 +1707,11 @@ impl DeliveryConnection {
                     .flatten()
                     .is_some_and(|(local, _)| local.node_fp == origin.node) =>
             {
-                FileLinkOrigin::LocalSession { session, instance }
+                FileLinkOrigin::LocalSession {
+                    node: origin.node.clone(),
+                    session,
+                    instance,
+                }
             }
             Self::Local => FileLinkOrigin::ClusterPeer {
                 peer: origin.node.clone(),
@@ -1726,6 +1735,7 @@ impl DeliveryConnection {
             return Err("Invalid source file URI.".into());
         };
         let mut document = read_linked_file(url, origin)?;
+        document.uri.clone_from(&request.uri);
         document.request = Some(request);
         Ok(document)
     }
@@ -1805,7 +1815,7 @@ fn serve(
 
 fn read_linked_file(url: url::Url, origin: FileLinkOrigin) -> Result<Document, String> {
     use std::io::Read as _;
-    let (uri, bytes) = match origin {
+    let (source_node, bytes) = match origin {
         FileLinkOrigin::Local => {
             let path = url.to_file_path().map_err(|_| "Invalid local file path")?;
             let mut options = std::fs::OpenOptions::new();
@@ -1829,9 +1839,13 @@ fn read_linked_file(url: url::Url, origin: FileLinkOrigin) -> Result<Document, S
             if bytes.len() > 1024 * 1024 {
                 return Err("The linked file exceeds the 1 MiB preview limit.".into());
             }
-            (url.as_str().to_owned(), bytes)
+            (None, bytes)
         }
-        FileLinkOrigin::LocalSession { session, instance } => {
+        FileLinkOrigin::LocalSession {
+            node,
+            session,
+            instance,
+        } => {
             let socket = remuda_native::daemon::socket_path("default");
             let bytes = remuda_native::net::browser::read_session_file_using(
                 &session,
@@ -1840,7 +1854,7 @@ fn read_linked_file(url: url::Url, origin: FileLinkOrigin) -> Result<Document, S
                 |request| remuda_native::client::request(&socket, &request),
             )
             .map_err(|error| error.to_string())?;
-            (url.as_str().to_owned(), bytes)
+            (Some(node), bytes)
         }
         FileLinkOrigin::ClusterPeer {
             peer,
@@ -1854,7 +1868,7 @@ fn read_linked_file(url: url::Url, origin: FileLinkOrigin) -> Result<Document, S
                 url.as_str(),
             )
             .map_err(|error| error.to_string())?;
-            (format!("{url} [{peer}]"), bytes)
+            (Some(peer), bytes)
         }
         FileLinkOrigin::BrowserPeer {
             workspace,
@@ -1871,12 +1885,13 @@ fn read_linked_file(url: url::Url, origin: FileLinkOrigin) -> Result<Document, S
             let source = workspace
                 .source_node()
                 .unwrap_or_else(|| workspace.destination());
-            (format!("{url} [{source}]"), bytes)
+            (Some(source.to_owned()), bytes)
         }
         FileLinkOrigin::Unavailable => return Err("No file access to the session's host.".into()),
     };
     Ok(Document {
-        uri,
+        uri: url.to_string(),
+        source_node,
         revision: remuda_native::cluster::vfs::sha256_hex(&bytes),
         media: browser_media::decode(url.path(), &bytes)?,
         request: None,
@@ -1905,6 +1920,7 @@ fn read(
         .then(|| Arc::from(bytes));
     Ok(Document {
         uri,
+        source_node: None,
         revision,
         media,
         request,
@@ -2209,7 +2225,7 @@ mod tests {
                 browser.tick(window, cx);
                 if let Some(tab) = browser.document_tab() {
                     assert_eq!(browser.document_tabs.len(), 1);
-                    assert_eq!(tab.document.media.title, "new.md");
+                    assert_eq!(tab.document.media.title, "GUI project preview");
                 }
             });
             cx.update(|window, app| window.draw(app).clear(app));
