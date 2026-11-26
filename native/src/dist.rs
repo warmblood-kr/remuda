@@ -47,6 +47,9 @@ pub fn is_channel(name: &str) -> bool {
     matches!(name, "stable" | "nightly")
 }
 
+/// Absolute path of the CLI that started the installed desktop tray.
+pub const TRAY_CLI_ENV: &str = "REMUDA_TRAY_CLI";
+
 /// Re-run the published install script with the channel pinned. It replaces the
 /// binary by rename, so upgrading from a running `remuda` is safe.
 pub fn upgrade(channel: Option<&str>) -> Result<(), String> {
