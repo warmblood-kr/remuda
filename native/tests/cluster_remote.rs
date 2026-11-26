@@ -622,6 +622,7 @@ fn prove_native_browser_receipt(
     args: &[&str],
     fixture: &Path,
     credential: &Path,
+    gateway: &Node,
     documents: &[(&str, &str)],
     publish: impl Fn(&str, &str) -> (bool, String),
 ) {
@@ -646,11 +647,25 @@ fn prove_native_browser_receipt(
     let ssh = shim.join("ssh");
     fs::write(
         &ssh,
-        "#!/bin/sh\nprintf 'ISOLATED_BROWSER_TERMINAL\\n'\nwhile IFS= read -r line; do printf '%s\\n' \"$line\"; done\n",
+        r#"#!/bin/sh
+for arg do
+    if [ "$arg" = 'remuda _browser-workspace' ]; then
+        printf '%s\n' workspace > "$REMUDA_FIXTURE_SSH_MODE"
+        exec env REMUDA_RUNTIME_DIR="$REMUDA_FIXTURE_GATEWAY_RUNTIME" \
+            XDG_CONFIG_HOME="$REMUDA_FIXTURE_GATEWAY_CONFIG" \
+            XDG_STATE_HOME="$REMUDA_FIXTURE_GATEWAY_STATE" \
+            "$REMUDA_FIXTURE_GATEWAY_BIN" -s "$REMUDA_FIXTURE_GATEWAY_NAME" _browser-workspace
+    fi
+done
+printf '%s\n' legacy > "$REMUDA_FIXTURE_SSH_MODE"
+printf 'ISOLATED_BROWSER_TERMINAL\n'
+while IFS= read -r line; do printf '%s\n' "$line"; done
+"#,
     )
     .unwrap();
     fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
     let log = fixture.join("browser.log");
+    let ssh_mode = fixture.join("ssh-mode");
     let path =
         std::env::join_paths([shim, PathBuf::from("/usr/bin"), PathBuf::from("/bin")]).unwrap();
     let mut process = BrowserProcess(
@@ -666,6 +681,12 @@ fn prove_native_browser_receipt(
             .env("XDG_RUNTIME_DIR", &runtime)
             .env("REMUDA_RUNTIME_DIR", &runtime)
             .env("REMUDA_BROWSER_CLIENT", credential)
+            .env("REMUDA_FIXTURE_GATEWAY_BIN", &gateway.binary)
+            .env("REMUDA_FIXTURE_GATEWAY_NAME", &gateway.name)
+            .env("REMUDA_FIXTURE_GATEWAY_RUNTIME", &gateway.runtime)
+            .env("REMUDA_FIXTURE_GATEWAY_CONFIG", gateway.root.join("config"))
+            .env("REMUDA_FIXTURE_GATEWAY_STATE", &gateway.state)
+            .env("REMUDA_FIXTURE_SSH_MODE", &ssh_mode)
             .stdout(Stdio::null())
             .stderr(fs::File::create(&log).unwrap())
             .spawn()
@@ -693,6 +714,9 @@ fn prove_native_browser_receipt(
         assert_eq!(publish(id, uri), (true, "displayed".into()));
     }
     assert!(process.0.try_wait().unwrap().is_none());
+    if args.first() == Some(&"--browser") {
+        assert_eq!(fs::read_to_string(ssh_mode).unwrap().trim(), "workspace");
+    }
     assert!(!remuda_native::daemon::socket_path_in(&runtime, "default").exists());
     assert!(!state.join("remuda/cluster").exists());
 }
@@ -947,7 +971,7 @@ impl BrowserRelayFixture {
         fs::write(
             &html_source,
             format!(
-                "<title>Isolated HTML design</title><h1>Design rendered in the native reader</h1><!--{}-->",
+                "<title>Isolated HTML design</title><h1>Native prototype</h1><button id='try'>Try prototype</button><output id='state'>Ready</output><script>document.getElementById('try').onclick=()=>document.getElementById('state').textContent='Prototype ran';</script><!--{}-->",
                 " ".repeat(70 * 1024)
             ),
         )
@@ -964,6 +988,7 @@ impl BrowserRelayFixture {
             args,
             &self.ingress.root.join("desktop"),
             &self.ingress.root.join("browser.key"),
+            &self.ingress,
             &documents,
             |id, uri| self.publish(id, uri),
         );
