@@ -220,3 +220,90 @@ fn cli_run_default_session_survives_reload_and_accepts_input() {
     daemon.wait_for("sh", "FROM_SEND:12");
     finish_daemon(&daemon);
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn reload_moves_legacy_default_storage_and_keeps_the_live_shell() {
+    use std::os::unix::fs::MetadataExt;
+
+    let daemon = Parity::start_named(Mode::Default, "default", &[]);
+    struct Cleanup<'a>(&'a Parity);
+    impl Drop for Cleanup<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.cli(&["stop", "-f"]);
+        }
+    }
+    let _cleanup = Cleanup(&daemon);
+    let before_instance = daemon.shell("sh");
+    let before_pid = shell_pid(&daemon, "PID_BEFORE_MOVE");
+    let original = daemon.root().join("remuda/default.sock.hosts");
+    let original_inode = original.metadata().unwrap().ino();
+    let check = daemon.cli(&["reload", "--check"]);
+    assert!(check.status.success(), "{check:?}");
+    assert!(!original.is_symlink());
+
+    let reload = daemon.cli(&["reload"]);
+    assert!(reload.status.success(), "{reload:?}");
+    let target = original.read_link().unwrap();
+    assert!(target.starts_with(
+        daemon
+            .root()
+            .join("Library/Application Support/Remuda/session-hosts")
+    ));
+    assert_eq!(original_inode, target.metadata().unwrap().ino());
+    assert!(target.join("inventory/inventory.json").is_file());
+    assert_eq!(instance(&daemon, "sh"), before_instance);
+    assert_eq!(shell_pid(&daemon, "PID_AFTER_MOVE"), before_pid);
+    let doctor = daemon.cli(&["doctor"]);
+    assert!(doctor.status.success(), "{doctor:?}");
+    let report = String::from_utf8(doctor.stdout).unwrap();
+    assert!(
+        report.contains(&format!("Host inventory: {}/inventory", target.display())),
+        "{report}"
+    );
+    finish_daemon(&daemon);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn migrated_storage_alias_is_recovered_after_daemon_restart() {
+    let mut daemon = Parity::start_named(Mode::Default, "default", &[]);
+    let before_instance = daemon.shell("sh");
+    let before_pid = shell_pid(&daemon, "PID_BEFORE_RESTART_MOVE");
+    let alias = daemon.root().join("remuda/default.sock.hosts");
+    assert!(!alias.is_symlink());
+    daemon.kill_daemon();
+    daemon.restart();
+    let target = alias.read_link().unwrap();
+
+    daemon.kill_daemon();
+    std::fs::remove_file(&alias).unwrap();
+    assert!(target.join("inventory/inventory.json").is_file());
+    daemon.restart();
+    assert_eq!(alias.read_link().unwrap(), target);
+    assert_eq!(instance(&daemon, "sh"), before_instance);
+    assert_eq!(shell_pid(&daemon, "PID_AFTER_RESTART_MOVE"), before_pid);
+    finish_daemon(&daemon);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn failed_candidate_leaves_old_daemon_and_moved_sessions_usable() {
+    let daemon = Parity::start_named(
+        Mode::Default,
+        "default",
+        &[(
+            "REMUDA_TEST_RELOAD_FAULT".into(),
+            "exit-before-serving".into(),
+        )],
+    );
+    let before_instance = daemon.shell("sh");
+    let before_pid = shell_pid(&daemon, "PID_BEFORE_ROLLBACK_MOVE");
+    let reload = daemon.cli(&["reload"]);
+    assert!(!reload.status.success(), "{reload:?}");
+    let alias = daemon.root().join("remuda/default.sock.hosts");
+    assert!(alias.is_symlink(), "{reload:?}");
+    assert_eq!(instance(&daemon, "sh"), before_instance);
+    assert_eq!(shell_pid(&daemon, "PID_AFTER_ROLLBACK_MOVE"), before_pid);
+    finish_daemon(&daemon);
+}

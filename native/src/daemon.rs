@@ -1152,6 +1152,8 @@ impl SocketLock {
             })?;
             let alias = socket_lock_path(socket);
             let hosting = crate::session_host::hosted::Hosting::for_socket(socket);
+            #[cfg(target_os = "macos")]
+            hosting.restore_relocated_storage()?;
             let state_root = hosting.split_state_root()?;
             let lock_path = state_root
                 .as_ref()
@@ -1205,6 +1207,10 @@ impl SocketLock {
             if let Some(root) = state_root.as_ref() {
                 hosting.pin_split_state(root)?;
             }
+            #[cfg(target_os = "macos")]
+            if let Err(error) = hosting.relocate_legacy_storage() {
+                eprintln!("remuda daemon: host storage migration skipped: {error}");
+            }
             Ok(Self {
                 _file: file,
                 state_root,
@@ -1240,6 +1246,12 @@ impl SocketLock {
             }
         }
         Self::name_this_process(file.as_raw_fd())?;
+        #[cfg(target_os = "macos")]
+        if let Err(error) =
+            crate::session_host::hosted::Hosting::for_socket(socket).relocate_legacy_storage()
+        {
+            eprintln!("remuda daemon: host storage migration skipped: {error}");
+        }
         Ok(Self {
             _file: file,
             state_root,
@@ -2248,6 +2260,31 @@ fn handle_request(
             reply(
                 &stream,
                 &Response::NodeStatus(crate::node_status::metrics(host_storage)),
+            )
+        }
+        Request::HostStoragePaths => {
+            #[cfg(unix)]
+            let (inventory, sockets, inventory_error) = {
+                let hosts = image.session_hosts();
+                let (inventory, error) = match hosts.inventory_path() {
+                    Ok(path) => (Some(path.display().to_string()), None),
+                    Err(error) => (None, Some(error.to_string())),
+                };
+                (
+                    inventory,
+                    Some(hosts.socket_root().display().to_string()),
+                    error,
+                )
+            };
+            #[cfg(not(unix))]
+            let (inventory, sockets, inventory_error) = (None, None, None);
+            reply(
+                &stream,
+                &Response::HostStoragePaths {
+                    inventory,
+                    sockets,
+                    inventory_error,
+                },
             )
         }
         Request::List => {

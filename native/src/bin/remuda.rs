@@ -402,6 +402,7 @@ fn dispatch_cli_command(
             Ok(()) => help_command(),
         },
         "version" | "--version" | "-V" => version_command(server, path, rest),
+        "doctor" => doctor_command(server, path, rest),
         "upgrade" => run_upgrade(path, rest),
         "daemon" => match ensure_no_args("daemon", rest) {
             Err(code) => code,
@@ -489,6 +490,7 @@ fn ensure_no_args(verb: &str, args: &[&str]) -> Result<(), ExitCode> {
     let about = match verb {
         "help" => "Show Remuda commands and quick examples. Example: remuda help",
         "version" => "Print the version of this CLI binary. Example: remuda version",
+        "doctor" => "Show CLI, daemon and session host storage diagnostics",
         "daemon" => "Run the background daemon in this process",
         "gui" => "Open the separately built read-only GUI for the default server",
         "ls" => "List sessions for the selected server. Example: remuda ls",
@@ -579,6 +581,53 @@ fn version_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
         }
         ExitCode::SUCCESS
     })
+}
+
+fn doctor_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
+    if let Err(code) = ensure_no_args("doctor", args) {
+        return code;
+    }
+    println!("Server: {server}");
+    println!("CLI (this invocation): {}", dist::BUILD_VERSION);
+    println!("Daemon endpoint: {}", path.display());
+    let request = |request| {
+        remuda_native::client::request_with_timeout(
+            path,
+            request,
+            std::time::Duration::from_secs(2),
+        )
+    };
+    match request(&Request::Version) {
+        Ok(Response::Value(build)) => println!("Daemon (running): {build}"),
+        Err(error) if remuda_native::ipc::may_start_daemon(path, &error) => {
+            println!("Daemon (running): not running");
+            return ExitCode::SUCCESS;
+        }
+        Err(error) => return fail(format!("daemon version: {error}")),
+        Ok(_) => return fail("daemon returned an unexpected version response"),
+    }
+    match request(&Request::HostStoragePaths) {
+        Ok(Response::HostStoragePaths {
+            inventory,
+            sockets,
+            inventory_error,
+        }) => {
+            println!(
+                "Host inventory: {}",
+                inventory.as_deref().unwrap_or("unavailable")
+            );
+            if let Some(error) = inventory_error {
+                println!("Inventory detail: {error}");
+            }
+            println!(
+                "Host sockets: {}",
+                sockets.as_deref().unwrap_or("unavailable")
+            );
+        }
+        Err(error) => println!("Host storage paths: unavailable ({error})"),
+        Ok(_) => println!("Host storage paths: unavailable from this daemon"),
+    }
+    ExitCode::SUCCESS
 }
 
 /// `daemon BUILD`, then one `host NAME BUILD` line per host-backed session.
@@ -1010,6 +1059,7 @@ remuda — terminal orchestration for coding agents
                                  --mouse=false disables mouse handling (before or after NAME)
   remuda ls | send NAME TEXT     inspect or message sessions
   remuda resize NAME COLS ROWS   resize a session (cols 20..1000, rows 24..500)
+  remuda doctor                             show daemon and host storage diagnostics
   remuda upgrade [--channel stable|nightly]  replace the CLI binary, then reload
   remuda reload [--check]        move the daemon onto this build; host-backed sessions keep running
   remuda stop [-f|--force]          stop the daemon and end its sessions
@@ -6216,6 +6266,9 @@ fn should_announce_update(
 }
 
 fn prepare_command(argv: &[&str], path: &Path) -> Result<Option<String>, String> {
+    if argv.first() == Some(&"doctor") {
+        return Ok(None);
+    }
     announce_update(argv);
     // Ask once before dispatch. A running daemon belongs to another binary,
     // and this is the cheapest point to check for a version skew.

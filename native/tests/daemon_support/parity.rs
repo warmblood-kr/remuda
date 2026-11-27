@@ -28,6 +28,7 @@ pub const MODES: [Mode; 2] = [Mode::InProcess, Mode::Hosted];
 pub struct Parity {
     pub mode: Mode,
     root: PathBuf,
+    server: &'static str,
     env: Vec<(String, String)>,
     daemon: Child,
 }
@@ -39,6 +40,10 @@ impl Parity {
 
     /// Start a daemon that also carries `env` in its own environment.
     pub fn start_with_env(mode: Mode, env: &[(String, String)]) -> Self {
+        Self::start_named(mode, "s", env)
+    }
+
+    pub fn start_named(mode: Mode, server: &'static str, env: &[(String, String)]) -> Self {
         let base = if cfg!(target_os = "macos") {
             "/private/tmp"
         } else {
@@ -54,10 +59,11 @@ impl Parity {
             .mode(0o700)
             .create(&root)
             .unwrap();
-        let daemon = spawn_daemon(mode, &root, env);
+        let daemon = spawn_daemon(mode, server, &root, env);
         let parity = Self {
             mode,
             root,
+            server,
             env: env.to_vec(),
             daemon,
         };
@@ -68,7 +74,7 @@ impl Parity {
     /// Start a fresh daemon in the same root, after this one has stopped.
     pub fn restart(&mut self) {
         let _ = self.daemon.wait();
-        self.daemon = spawn_daemon(self.mode, &self.root, &self.env);
+        self.daemon = spawn_daemon(self.mode, self.server, &self.root, &self.env);
         self.wait_bound();
     }
 
@@ -99,7 +105,7 @@ impl Parity {
     /// Run the `remuda` CLI against this daemon.
     pub fn cli(&self, args: &[&str]) -> std::process::Output {
         Command::new(env!("CARGO_BIN_EXE_remuda"))
-            .args(["-s", "s"])
+            .args(["-s", self.server])
             .args(args)
             .env("REMUDA_RUNTIME_DIR", &self.root)
             .env("HOME", &self.root)
@@ -115,7 +121,7 @@ impl Parity {
     }
 
     pub fn socket(&self) -> PathBuf {
-        daemon::socket_path_in(&self.root, "s")
+        daemon::socket_path_in(&self.root, self.server)
     }
 
     pub fn root(&self) -> &Path {
@@ -193,11 +199,12 @@ impl Drop for Parity {
     }
 }
 
-fn spawn_daemon(mode: Mode, root: &Path, env: &[(String, String)]) -> Child {
+fn spawn_daemon(mode: Mode, server: &str, root: &Path, env: &[(String, String)]) -> Child {
     let mut command = Command::new(env!("CARGO_BIN_EXE_remuda"));
     command
-        .args(["-s", "s", "daemon"])
+        .args(["-s", server, "daemon"])
         .env("REMUDA_RUNTIME_DIR", root)
+        .env_remove("REMUDA_SESSION_HOST_STATE_DIR")
         .env("HOME", root)
         .env("XDG_STATE_HOME", root.join("state"))
         // Named either way, so a change of default never changes the mode.

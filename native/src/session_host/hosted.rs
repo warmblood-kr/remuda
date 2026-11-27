@@ -294,11 +294,120 @@ impl Hosting {
             )
         }
 
-        let inventory = self
-            .state_root()
-            .ok()
-            .and_then(|root| in_temp(&root.join("inventory")));
+        let inventory = self.inventory_path().ok().and_then(|path| in_temp(&path));
         (inventory, in_temp(&self.socket_root))
+    }
+
+    pub(crate) fn inventory_path(&self) -> io::Result<PathBuf> {
+        let root = self.state_root()?;
+        Ok(root.canonicalize().unwrap_or(root).join("inventory"))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn legacy_destination(&self) -> io::Result<Option<PathBuf>> {
+        let Some(socket) = self.socket.as_ref() else {
+            return Ok(None);
+        };
+        if socket.file_name() != Some(std::ffi::OsStr::new("default.sock")) {
+            return Ok(None);
+        }
+        let parent = self
+            .socket_root
+            .parent()
+            .ok_or_else(|| io::Error::other("missing socket parent"))?;
+        let parent = parent.canonicalize()?;
+        let temporary = [
+            std::env::temp_dir(),
+            PathBuf::from("/tmp"),
+            PathBuf::from("/var/tmp"),
+        ];
+        if !temporary.iter().any(|root| {
+            root.canonicalize()
+                .is_ok_and(|root| parent.starts_with(root))
+        }) {
+            return Ok(None);
+        }
+        let identity = parent.join("default.sock.hosts");
+        let namespace = hex(&super::inventory::model::hash(
+            identity.as_os_str().as_encoded_bytes(),
+        ));
+        Ok(Some(
+            default_state_base()?
+                .join(format!("legacy-{namespace}"))
+                .join(boot_namespace()?),
+        ))
+    }
+
+    /// On this boot the permanent directory can outlive a removed runtime alias.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn restore_relocated_storage(&self) -> io::Result<()> {
+        if metadata_if_present(&self.socket_root)?.is_some() {
+            return Ok(());
+        }
+        let Some(target) = self.legacy_destination()? else {
+            return Ok(());
+        };
+        if !metadata_if_present(&target)?.is_some_and(|info| info.is_dir()) {
+            return Ok(());
+        }
+        super::unix::directory(&target)?;
+        match std::os::unix::fs::symlink(target, &self.socket_root) {
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            result => result,
+        }
+    }
+
+    /// Rename the entire legacy tree atomically. The old path remains an alias
+    /// for both old hosts and an old daemon that resumes after a failed handoff.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn relocate_legacy_storage(&self) -> io::Result<()> {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+        let Some(target) = self.legacy_destination()? else {
+            return Ok(());
+        };
+        if !metadata_if_present(&self.socket_root)?.is_some_and(|info| info.is_dir())
+            || !metadata_if_present(&self.socket_root.join("inventory"))?
+                .is_some_and(|info| info.is_dir())
+            || self.split_state_root()?.is_some()
+        {
+            return Ok(());
+        }
+        let legacy = super::unix::directory(&self.socket_root)?;
+        let source_parent = self.socket_root.parent().unwrap();
+        let source_dir = super::unix::directory(source_parent)?;
+        let target_parent = target.parent().unwrap();
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(target_parent)?;
+        let target_dir = super::unix::directory(target_parent)?;
+        if legacy.metadata()?.dev() != target_dir.metadata()?.dev() {
+            return Err(io::Error::other(
+                "live host storage cannot be moved across volumes",
+            ));
+        }
+        match std::os::unix::fs::symlink(&target, &target) {
+            Err(error)
+                if error.kind() == io::ErrorKind::AlreadyExists
+                    && std::fs::read_link(&target).ok().as_ref() == Some(&target) => {}
+            result => result?,
+        }
+        // A self-link at the destination is only staging. After the exchange
+        // each open descriptor still refers to the same original inode.
+        crate::staged_socket::exchange(
+            &source_dir,
+            self.socket_root.file_name().unwrap(),
+            &target_dir,
+            target.file_name().unwrap(),
+        )?;
+        target_dir.sync_all()?;
+        source_dir.sync_all()?;
+        Ok(())
+    }
+
+    pub(crate) fn socket_root(&self) -> &Path {
+        &self.socket_root
     }
 
     pub(crate) fn split_state_root(&self) -> io::Result<Option<PathBuf>> {

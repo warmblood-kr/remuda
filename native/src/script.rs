@@ -2754,7 +2754,7 @@ fn set_program_status(
 /// would otherwise carry on over a session that was never created.
 fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
     match response {
-        Response::NodeStatus(_) => Err(mlua::Error::runtime(
+        Response::NodeStatus(_) | Response::HostStoragePaths { .. } => Err(mlua::Error::runtime(
             "node status is not exposed to scripts",
         )),
         Response::RenderedSessionList(_) => Err(mlua::Error::runtime(

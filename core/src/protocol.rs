@@ -199,6 +199,8 @@ pub struct HostBuild {
 pub enum Request {
     /// Read-only resource usage for the node running this daemon.
     NodeStatus,
+    /// Local-only diagnostic for the daemon’s session host storage.
+    HostStoragePaths,
     /// Every session this node holds.
     List,
     /// One bounded Lua-rendered view and its exact session snapshot.
@@ -545,6 +547,11 @@ pub enum Response {
         outcome: BrowserDocumentOutcome,
     },
     NodeStatus(Option<NodeMetrics>),
+    HostStoragePaths {
+        inventory: Option<String>,
+        sockets: Option<String>,
+        inventory_error: Option<String>,
+    },
     Sessions(Vec<SessionSummary>),
     /// Answer to [`Request::SessionHostBuilds`], sorted by name.
     SessionHostBuilds(Vec<HostBuild>),

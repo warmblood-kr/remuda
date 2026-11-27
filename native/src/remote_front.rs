@@ -461,6 +461,7 @@ pub fn authorize(request: &Request) -> Result<(), String> {
         Request::Mkdir { .. } => Err(refusal("Mkdir")),
         Request::RemoveDirAll { .. } => Err(refusal("RemoveDirAll")),
         Request::Version => Err(refusal("Version")),
+        Request::HostStoragePaths => Err(refusal("HostStoragePaths")),
         Request::SessionHostReservations => Err(refusal("SessionHostReservations")),
         Request::SessionHostBuilds => Err(refusal("SessionHostBuilds")),
         Request::Reload { .. } => Err(refusal("Reload")),
@@ -883,6 +884,7 @@ mod tests {
             Request::Mkdir { path: "/".into() },
             Request::RemoveDirAll { path: "/".into() },
             Request::Version,
+            Request::HostStoragePaths,
             Request::ClusterRegistrySync {
                 digest: None,
                 offset: 0,
