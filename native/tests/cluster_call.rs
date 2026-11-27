@@ -497,6 +497,11 @@ fn node_status_samples_through_local_ipc_and_authenticated_peer() {
         wait_for_sample(|| remuda_native::client::request(&path, &Request::NodeStatus).unwrap());
     assert!(remote.age_ms < 15_000);
     assert!(local.age_ms < 15_000);
+    let build = Some(remuda_native::dist::BUILD_VERSION.to_owned());
+    assert_eq!(local.daemon_version, build);
+    assert_eq!(local.cli_version, build);
+    assert_eq!(remote.daemon_version, local.daemon_version);
+    assert_eq!(remote.cli_version, local.cli_version);
     assert!(remote.cpu_percent.is_some_and(|value| value <= 100));
     assert!(remote
         .memory

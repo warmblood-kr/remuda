@@ -508,6 +508,9 @@ impl LocalGui {
                                 .map(|metric| render_node_metric(metric, details.stale, compact)),
                         ),
                 )
+                .children(details.version_lines().map(|line| {
+                    div().text_sm().text_color(rgb(0xb5beca)).py_1().child(line)
+                }))
                 .child(div().pt_3().pb_1().child("Sessions"))
                 .when(rows_loading, |el| el.child("Loading sessions…"))
                 .when(rows_unavailable, |el| {

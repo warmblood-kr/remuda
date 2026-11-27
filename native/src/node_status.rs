@@ -36,6 +36,19 @@ fn sample_loop(cache: &Mutex<Sample>) {
     let mut system = System::new();
     let mut disks = Disks::new();
     let mount = system_mount();
+    let cli_path = std::env::current_exe().ok().map(|path| {
+        // Linux can append this suffix when the installed file was replaced
+        // before the first status request.
+        #[cfg(target_os = "linux")]
+        if let Some(original) = path
+            .to_str()
+            .and_then(|path| path.strip_suffix(" (deleted)"))
+        {
+            return PathBuf::from(original);
+        }
+        path
+    });
+    let mut cli_build = None;
     system.refresh_cpu_usage();
     std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
     loop {
@@ -43,8 +56,23 @@ fn sample_loop(cache: &Mutex<Sample>) {
         system.refresh_cpu_usage();
         system.refresh_memory();
         disks.refresh_list();
+        let cli_version = cli_path.as_deref().and_then(|path| {
+            let metadata = path.metadata().ok()?;
+            let key = (metadata.modified().ok()?, metadata.len());
+            if cli_build
+                .as_ref()
+                .is_none_or(|(last_key, version): &(_, Option<String>)| {
+                    *last_key != key || version.is_none()
+                })
+            {
+                cli_build = Some((key, installed_cli_version(path)));
+            }
+            cli_build.as_ref().and_then(|(_, version)| version.clone())
+        });
         let sample = NodeMetrics {
             age_ms: 0,
+            daemon_version: Some(crate::dist::BUILD_VERSION.into()),
+            cli_version,
             cpu_percent: (!system.cpus().is_empty())
                 .then(|| system.global_cpu_usage())
                 .filter(|usage| (0.0..=100.0).contains(usage))
@@ -65,6 +93,32 @@ fn sample_loop(cache: &Mutex<Sample>) {
         }
         std::thread::sleep(SAMPLE_INTERVAL);
     }
+}
+
+// Probe the executable at the daemon's launch path, so an atomically replaced
+// CLI can report its own build while the old daemon is still running.
+fn installed_cli_version(path: &Path) -> Option<String> {
+    let output = crate::process::run_sync(
+        vec![path.to_str()?.to_owned(), "--version".into()],
+        None,
+        1.0,
+        None,
+        None,
+    )
+    .ok()?;
+    if output.code != 0 || output.timed_out {
+        return None;
+    }
+    let version = std::str::from_utf8(&output.stdout)
+        .ok()?
+        .trim()
+        .strip_prefix("remuda ")?;
+    displayable_version(version).map(str::to_owned)
+}
+
+fn displayable_version(version: &str) -> Option<&str> {
+    (!version.is_empty() && version.len() <= 200 && version.bytes().all(|b| b.is_ascii_graphic()))
+        .then_some(version)
 }
 
 fn system_mount() -> Option<PathBuf> {
@@ -118,6 +172,22 @@ pub struct Details {
     pub age: Option<Duration>,
     pub stale: bool,
     pub metrics: [Metric; 3],
+    pub daemon_version: Option<String>,
+    pub cli_version: Option<String>,
+}
+
+impl Details {
+    pub fn version_lines(&self) -> [String; 2] {
+        let suffix = if self.stale { " (stale)" } else { "" };
+        [
+            ("Daemon (running)", self.daemon_version.as_deref()),
+            ("CLI (installed)", self.cli_version.as_deref()),
+        ]
+        .map(|(label, version)| match version.and_then(displayable_version) {
+            Some(version) => format!("{label}  {version}{suffix}"),
+            None => format!("{label}  unavailable"),
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -276,6 +346,8 @@ impl Status {
             health,
             age,
             stale,
+            daemon_version: sample.and_then(|sample| sample.daemon_version.clone()),
+            cli_version: sample.and_then(|sample| sample.cli_version.clone()),
             metrics: [
                 Metric {
                     label: "CPU",
@@ -290,18 +362,19 @@ impl Status {
         }
     }
 
-    pub fn lines(&self) -> [String; 4] {
+    pub fn lines(&self) -> [String; 6] {
         let details = self.details();
         let health = details.age.map_or_else(
             || details.health.into(),
             |age| format!("{} · updated {}s ago", details.health, age.as_secs()),
         );
         let suffix = if details.stale { " (stale)" } else { "" };
+        let [daemon, cli] = details.version_lines();
         let [cpu, memory, disk] = details.metrics.map(|metric| match metric.percent {
             Some(percent) => format!("{}  {percent}%{suffix}", metric.label),
             None => format!("{}  unavailable", metric.label),
         });
-        [health, cpu, memory, disk]
+        [health, daemon, cli, cpu, memory, disk]
     }
 }
 
@@ -316,6 +389,8 @@ mod tests {
         let b = Node::Peer("b".into());
         let sample = NodeMetrics {
             age_ms: 20_000,
+            daemon_version: Some("daemon-build".into()),
+            cli_version: Some("cli-build".into()),
             cpu_percent: Some(18),
             memory: Some(ResourceUsage {
                 used_bytes: 50,
@@ -337,6 +412,13 @@ mod tests {
         status.last = Some((now, Some(sample)));
         let details = status.details_for(&b);
         assert!(details.stale);
+        assert_eq!(
+            details.version_lines(),
+            [
+                "Daemon (running)  daemon-build (stale)",
+                "CLI (installed)  cli-build (stale)",
+            ]
+        );
         assert_eq!(details.metrics[0].percent, Some(18));
         assert_eq!(details.metrics[1].percent, Some(50));
         assert_eq!(details.metrics[2].percent, None);
