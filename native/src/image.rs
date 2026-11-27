@@ -426,7 +426,7 @@ pub struct Image {
 
 impl Image {
     #[cfg(unix)]
-    pub(crate) fn session_hosts(&self) -> &crate::session_host::hosted::Hosting {
+    pub(crate) fn session_hosts(&self) -> &Arc<crate::session_host::hosted::Hosting> {
         &self.session_hosts
     }
 

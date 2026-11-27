@@ -502,6 +502,10 @@ fn node_status_samples_through_local_ipc_and_authenticated_peer() {
     assert_eq!(local.cli_version, build);
     assert_eq!(remote.daemon_version, local.daemon_version);
     assert_eq!(remote.cli_version, local.cli_version);
+    assert_eq!(local.host_inventory_in_temp, Some(true));
+    assert_eq!(local.host_sockets_in_temp, Some(true));
+    assert_eq!(remote.host_inventory_in_temp, local.host_inventory_in_temp);
+    assert_eq!(remote.host_sockets_in_temp, local.host_sockets_in_temp);
     assert!(remote.cpu_percent.is_some_and(|value| value <= 100));
     assert!(remote
         .memory

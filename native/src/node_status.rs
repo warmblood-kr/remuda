@@ -13,7 +13,9 @@ const STALE_AFTER: Duration = Duration::from_secs(15);
 
 type Sample = Option<(Instant, NodeMetrics)>;
 
-pub(crate) fn metrics() -> Option<NodeMetrics> {
+pub(crate) fn metrics(
+    host_storage: impl Fn() -> (Option<bool>, Option<bool>) + Send + 'static,
+) -> Option<NodeMetrics> {
     // Requests only read the cache. Even a stalled disk query cannot block
     // daemon requests or start another sampler.
     static CACHE: OnceLock<Arc<Mutex<Sample>>> = OnceLock::new();
@@ -22,7 +24,7 @@ pub(crate) fn metrics() -> Option<NodeMetrics> {
         let worker = Arc::clone(&cache);
         let _ = std::thread::Builder::new()
             .name("node-metrics".into())
-            .spawn(move || sample_loop(&worker));
+            .spawn(move || sample_loop(&worker, host_storage));
         cache
     });
     let guard = cache.lock().ok()?;
@@ -32,7 +34,7 @@ pub(crate) fn metrics() -> Option<NodeMetrics> {
     Some(sample)
 }
 
-fn sample_loop(cache: &Mutex<Sample>) {
+fn sample_loop(cache: &Mutex<Sample>, host_storage: impl Fn() -> (Option<bool>, Option<bool>)) {
     let mut system = System::new();
     let mut disks = Disks::new();
     let mount = system_mount();
@@ -69,10 +71,13 @@ fn sample_loop(cache: &Mutex<Sample>) {
             }
             cli_build.as_ref().and_then(|(_, version)| version.clone())
         });
+        let (host_inventory_in_temp, host_sockets_in_temp) = host_storage();
         let sample = NodeMetrics {
             age_ms: 0,
             daemon_version: Some(crate::dist::BUILD_VERSION.into()),
             cli_version,
+            host_inventory_in_temp,
+            host_sockets_in_temp,
             cpu_percent: (!system.cpus().is_empty())
                 .then(|| system.global_cpu_usage())
                 .filter(|usage| (0.0..=100.0).contains(usage))
@@ -174,19 +179,39 @@ pub struct Details {
     pub metrics: [Metric; 3],
     pub daemon_version: Option<String>,
     pub cli_version: Option<String>,
+    pub host_inventory_in_temp: Option<bool>,
+    pub host_sockets_in_temp: Option<bool>,
 }
 
 impl Details {
+    pub fn storage_lines(&self) -> [String; 2] {
+        let suffix = if self.stale { " (stale)" } else { "" };
+        [
+            ("Host inventory", self.host_inventory_in_temp),
+            ("Host sockets", self.host_sockets_in_temp),
+        ]
+        .map(|(label, location)| {
+            let location = match location {
+                Some(true) => "Temporary directory",
+                Some(false) => "Outside temporary directory",
+                None => return format!("{label}  unavailable"),
+            };
+            format!("{label}  {location}{suffix}")
+        })
+    }
+
     pub fn version_lines(&self) -> [String; 2] {
         let suffix = if self.stale { " (stale)" } else { "" };
         [
             ("Daemon (running)", self.daemon_version.as_deref()),
             ("CLI (installed)", self.cli_version.as_deref()),
         ]
-        .map(|(label, version)| match version.and_then(displayable_version) {
-            Some(version) => format!("{label}  {version}{suffix}"),
-            None => format!("{label}  unavailable"),
-        })
+        .map(
+            |(label, version)| match version.and_then(displayable_version) {
+                Some(version) => format!("{label}  {version}{suffix}"),
+                None => format!("{label}  unavailable"),
+            },
+        )
     }
 }
 
@@ -348,6 +373,8 @@ impl Status {
             stale,
             daemon_version: sample.and_then(|sample| sample.daemon_version.clone()),
             cli_version: sample.and_then(|sample| sample.cli_version.clone()),
+            host_inventory_in_temp: sample.and_then(|sample| sample.host_inventory_in_temp),
+            host_sockets_in_temp: sample.and_then(|sample| sample.host_sockets_in_temp),
             metrics: [
                 Metric {
                     label: "CPU",
@@ -362,7 +389,7 @@ impl Status {
         }
     }
 
-    pub fn lines(&self) -> [String; 6] {
+    pub fn lines(&self) -> [String; 8] {
         let details = self.details();
         let health = details.age.map_or_else(
             || details.health.into(),
@@ -374,7 +401,8 @@ impl Status {
             Some(percent) => format!("{}  {percent}%{suffix}", metric.label),
             None => format!("{}  unavailable", metric.label),
         });
-        [health, daemon, cli, cpu, memory, disk]
+        let [inventory, sockets] = details.storage_lines();
+        [health, daemon, cli, cpu, memory, disk, inventory, sockets]
     }
 }
 
@@ -389,6 +417,8 @@ mod tests {
         let b = Node::Peer("b".into());
         let sample = NodeMetrics {
             age_ms: 20_000,
+            host_inventory_in_temp: Some(false),
+            host_sockets_in_temp: Some(true),
             daemon_version: Some("daemon-build".into()),
             cli_version: Some("cli-build".into()),
             cpu_percent: Some(18),
@@ -417,6 +447,13 @@ mod tests {
             [
                 "Daemon (running)  daemon-build (stale)",
                 "CLI (installed)  cli-build (stale)",
+            ]
+        );
+        assert_eq!(
+            details.storage_lines(),
+            [
+                "Host inventory  Outside temporary directory (stale)",
+                "Host sockets  Temporary directory (stale)",
             ]
         );
         assert_eq!(details.metrics[0].percent, Some(18));
