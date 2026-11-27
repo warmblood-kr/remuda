@@ -403,6 +403,7 @@ fn dispatch_cli_command(
         },
         "version" | "--version" | "-V" => version_command(server, path, rest),
         "doctor" => doctor_command(server, path, rest),
+        "force-close" => force_close_command(path, rest),
         "upgrade" => run_upgrade(path, rest),
         "daemon" => match ensure_no_args("daemon", rest) {
             Err(code) => code,
@@ -628,6 +629,76 @@ fn doctor_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
         Ok(_) => println!("Host storage paths: unavailable from this daemon"),
     }
     ExitCode::SUCCESS
+}
+
+fn force_close_command(path: &Path, args: &[&str]) -> ExitCode {
+    use remuda_native::cli_parse::{ArgSpec, OptionSpec};
+    let spec = simple_cli_spec(
+        "force-close",
+        "Force a local macOS session and its host to exit, even if host credentials are missing",
+        vec![ArgSpec {
+            name: "SESSION".into(),
+            help: "Exact session name".into(),
+            multiple: false,
+            required: true,
+        }],
+        vec![OptionSpec {
+            long: "yes".into(),
+            short: None,
+            value: None,
+            help: "Confirm forced termination".into(),
+            global: false,
+            required: true,
+            repeat_policy: Default::default(),
+        }],
+        "remuda force-close SESSION --yes",
+    );
+    let arguments = match parse_top_level_cli(&spec, "force-close", args) {
+        Ok(arguments) => arguments,
+        Err(code) => return code,
+    };
+    if !cfg!(target_os = "macos") {
+        return fail("force close is available on macOS only");
+    }
+    let Some(name) = arguments.get("SESSION").and_then(serde_json::Value::as_str) else {
+        return fail("force close requires a session name");
+    };
+    if !cli_flag(&arguments, "yes") {
+        return fail("force close requires --yes");
+    }
+    let request = |request| {
+        remuda_native::client::request_with_timeout(
+            path,
+            request,
+            std::time::Duration::from_secs(8),
+        )
+    };
+    let sessions = match request(&Request::List) {
+        Ok(Response::Sessions(sessions)) => sessions,
+        Ok(Response::Error(error)) => return fail(error),
+        Ok(_) => return fail("unexpected session list response"),
+        Err(error) => return fail(error),
+    };
+    let Some(instance_id) = sessions
+        .into_iter()
+        .find(|session| session.name == name)
+        .and_then(|session| session.instance_id)
+    else {
+        return fail("the selected session instance is unavailable or no longer listed");
+    };
+    match request(&Request::ForceClose {
+        name: name.into(),
+        instance_id,
+        confirm: true,
+    }) {
+        Ok(Response::Ok) => {
+            println!("Force-closed {name}");
+            ExitCode::SUCCESS
+        }
+        Ok(Response::Error(error)) => fail(error),
+        Ok(_) => fail("unexpected force-close response"),
+        Err(error) => fail(error),
+    }
 }
 
 /// `daemon BUILD`, then one `host NAME BUILD` line per host-backed session.
@@ -1060,6 +1131,7 @@ remuda — terminal orchestration for coding agents
   remuda ls | send NAME TEXT     inspect or message sessions
   remuda resize NAME COLS ROWS   resize a session (cols 20..1000, rows 24..500)
   remuda doctor                             show daemon and host storage diagnostics
+  remuda force-close NAME --yes             force-close a local macOS session
   remuda upgrade [--channel stable|nightly]  replace the CLI binary, then reload
   remuda reload [--check]        move the daemon onto this build; host-backed sessions keep running
   remuda stop [-f|--force]          stop the daemon and end its sessions
@@ -6266,7 +6338,7 @@ fn should_announce_update(
 }
 
 fn prepare_command(argv: &[&str], path: &Path) -> Result<Option<String>, String> {
-    if argv.first() == Some(&"doctor") {
+    if matches!(argv.first(), Some(&"doctor" | &"force-close")) {
         return Ok(None);
     }
     announce_update(argv);

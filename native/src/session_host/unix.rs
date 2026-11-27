@@ -476,6 +476,19 @@ pub(crate) fn connect(path: &Path) -> io::Result<Channel<UnixStream>> {
     verify_peer(&stream, uid())?;
     Channel::authenticate_until(stream, &key, true, until)
 }
+#[cfg(target_os = "macos")]
+pub(super) fn connect_for_process_inspection(path: &Path) -> io::Result<UnixStream> {
+    directory(path)?;
+    let socket = socket_path(path)?;
+    let info = std::fs::symlink_metadata(&socket)?;
+    if !info.file_type().is_socket() || info.uid() != uid() || info.mode() & 0o7777 != 0o600 {
+        return Err(denied());
+    }
+    let stream = connect_until(&socket, Instant::now() + Duration::from_secs(1))?;
+    verify_peer(&stream, uid())?;
+    Ok(stream)
+}
+
 fn connect_until(path: &Path, until: Instant) -> io::Result<UnixStream> {
     use std::os::fd::{FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;

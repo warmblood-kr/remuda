@@ -1581,6 +1581,21 @@ fn close(registry: &Registry, image: &Image, name: &str) -> Option<AgentResult<(
     Some(closed.map(drop))
 }
 
+#[cfg(target_os = "macos")]
+fn force_close_hosted(
+    registry: &Registry,
+    image: &Image,
+    name: &str,
+    instance: &str,
+) -> Result<(), String> {
+    image.session_hosts().force_close(name, instance)?;
+    if let Some(handle) = registry.remove_hosted_instance(name, instance) {
+        let identity = handle.identity();
+        notify_exited(image, name, &identity.id, instance, "closed", None);
+    }
+    Ok(())
+}
+
 /// A host-backed session (#713): close its child, then stop the host and
 /// retire its inventory entry in the background.
 fn close_hosted(
@@ -2260,6 +2275,27 @@ fn handle_request(
             reply(
                 &stream,
                 &Response::NodeStatus(crate::node_status::metrics(host_storage)),
+            )
+        }
+        Request::ForceClose { confirm: false, .. } => reply(
+            &stream,
+            &Response::error("force close requires confirmation"),
+        ),
+        Request::ForceClose {
+            name,
+            instance_id,
+            confirm: true,
+        } => {
+            #[cfg(target_os = "macos")]
+            let result = force_close_hosted(registry, image, &name, &instance_id);
+            #[cfg(not(target_os = "macos"))]
+            let result = {
+                let _ = (name, instance_id);
+                Err("force close is available on macOS only".into())
+            };
+            reply(
+                &stream,
+                &result.map_or_else(Response::error, |()| Response::Ok),
             )
         }
         Request::HostStoragePaths => {

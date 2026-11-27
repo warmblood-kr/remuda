@@ -698,6 +698,52 @@ impl Hosting {
             .flatten()
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn force_close(&self, name: &str, instance: &str) -> Result<(), String> {
+        let _permit = self
+            .gate
+            .enter()
+            .map_err(|_| "session host handoff in progress")?;
+        let hosts = self
+            .hosts(false)
+            .map_err(|error| error.to_string())?
+            .ok_or("no session host inventory")?;
+        let index = hosts.owner.index().map_err(|error| format!("{error:?}"))?;
+        let entry = index
+            .entries
+            .get(name)
+            .filter(|entry| entry.identity.instance == instance)
+            .ok_or("session instance is no longer current")?;
+        if !matches!(entry.phase, Phase::Registered) {
+            return Err("only a published live instance can be force-closed".into());
+        }
+        let birth = entry
+            .birth
+            .as_ref()
+            .ok_or("session endpoint is missing from the inventory")?;
+        let endpoint = Path::new(birth.endpoint());
+        if !endpoint.parent().is_some_and(|parent| parent == hosts.root) {
+            return Err("session endpoint is outside this daemon's host storage".into());
+        }
+        let target = Target {
+            name: name.into(),
+            identity: entry.identity.clone(),
+        };
+        super::force_close::end(endpoint).map_err(|error| format!("force close: {error}"))?;
+        hosts
+            .owner
+            .retire_force_closed(&target)
+            .map_err(|error| format!("processes ended, but inventory cleanup failed: {error:?}"))?;
+        let mut open = hosts.open.lock().unwrap_or_else(|error| error.into_inner());
+        if open
+            .get(name)
+            .is_some_and(|session| session.matches_instance(instance))
+        {
+            open.remove(name);
+        }
+        Ok(())
+    }
+
     /// Claim the inventory again under a newer epoch, then show every open
     /// host the new writer, fencing any daemon that claimed since. Returns
     /// each host's answer; none before this daemon opened its inventory.

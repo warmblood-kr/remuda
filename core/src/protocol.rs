@@ -201,6 +201,12 @@ pub enum Request {
     NodeStatus,
     /// Local-only diagnostic for the daemon’s session host storage.
     HostStoragePaths,
+    /// The operator explicitly chose force-close for this exact instance.
+    ForceClose {
+        name: String,
+        instance_id: String,
+        confirm: bool,
+    },
     /// Every session this node holds.
     List,
     /// One bounded Lua-rendered view and its exact session snapshot.

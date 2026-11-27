@@ -307,3 +307,48 @@ fn failed_candidate_leaves_old_daemon_and_moved_sessions_usable() {
     assert_eq!(shell_pid(&daemon, "PID_AFTER_ROLLBACK_MOVE"), before_pid);
     finish_daemon(&daemon);
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn force_close_uses_the_verified_host_when_all_metadata_is_missing() {
+    let mut daemon = Parity::start(Mode::Default);
+    let instance_id = daemon.shell("lost");
+    let control = daemon.shell("control");
+    let root = daemon.root().join("remuda/s.sock.hosts");
+    let (endpoint, owner) = std::fs::read_dir(root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let data = std::fs::read(entry.path().join("owner.json")).ok()?;
+            Some((
+                entry.path(),
+                serde_json::from_slice::<serde_json::Value>(&data).ok()?,
+            ))
+        })
+        .find(|(_, owner)| owner["identity"]["instance"] == instance_id)
+        .expect("isolated test endpoint");
+    for name in ["capability", "owner.json", "session.json"] {
+        std::fs::remove_file(endpoint.join(name)).unwrap();
+    }
+    daemon.kill_daemon();
+    daemon.restart();
+    assert!(matches!(
+        daemon.request(&Request::ForceClose {
+            name: "lost".into(),
+            instance_id: control.clone(),
+            confirm: true
+        }),
+        Response::Error(_)
+    ));
+    let out = daemon.cli(&["force-close", "lost", "--yes"]);
+    assert!(out.status.success(), "{out:?}");
+    for key in ["host", "child"] {
+        let pid = i32::try_from(owner[key].as_i64().unwrap()).unwrap();
+        assert!(pid > 1);
+        // SAFETY: signal 0 observes the PIDs of disposable fixture processes.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "{key} was still running");
+    }
+    assert_eq!(instance(&daemon, "control"), control);
+    assert_ne!(daemon.shell("lost"), instance_id);
+    assert!(daemon.cli(&["stop", "-f"]).status.success());
+}

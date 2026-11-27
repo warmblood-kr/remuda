@@ -355,9 +355,9 @@ fn request_timeout(request: &Request) -> std::time::Duration {
             std::time::Duration::from_millis((*timeout_ms).min(remuda_core::sync::MAX_TIMEOUT_MS))
                 + SYNC_TIMEOUT_MARGIN
         }
-        Request::InputLine { .. } | Request::RemoteInputLine { .. } => {
-            std::time::Duration::from_secs(8)
-        }
+        Request::InputLine { .. }
+        | Request::RemoteInputLine { .. }
+        | Request::ForceClose { .. } => std::time::Duration::from_secs(8),
         _ => CONNECTION_TIMEOUT,
     }
 }
@@ -462,6 +462,12 @@ pub fn authorize(request: &Request) -> Result<(), String> {
         Request::RemoveDirAll { .. } => Err(refusal("RemoveDirAll")),
         Request::Version => Err(refusal("Version")),
         Request::HostStoragePaths => Err(refusal("HostStoragePaths")),
+        Request::ForceClose {
+            instance_id,
+            confirm: true,
+            ..
+        } if !instance_id.is_empty() => Ok(()),
+        Request::ForceClose { .. } => Err(refusal("ForceClose")),
         Request::SessionHostReservations => Err(refusal("SessionHostReservations")),
         Request::SessionHostBuilds => Err(refusal("SessionHostBuilds")),
         Request::Reload { .. } => Err(refusal("Reload")),
@@ -885,6 +891,11 @@ mod tests {
             Request::RemoveDirAll { path: "/".into() },
             Request::Version,
             Request::HostStoragePaths,
+            Request::ForceClose {
+                name: "dev".into(),
+                instance_id: String::new(),
+                confirm: false,
+            },
             Request::ClusterRegistrySync {
                 digest: None,
                 offset: 0,
