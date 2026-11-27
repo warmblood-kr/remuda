@@ -2291,7 +2291,7 @@ fn handle_request(
             #[cfg(not(target_os = "macos"))]
             let result = {
                 let _ = (name, instance_id);
-                Err("force close is available on macOS only".into())
+                Err("force close is available on macOS only")
             };
             reply(
                 &stream,
