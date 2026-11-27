@@ -13,11 +13,20 @@ on:
     branches: [main]
     paths: *browser_paths
 
+concurrency:
+  group: browser-gui-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build:
     name: Build Browser for ${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    # Release packages are built and checked separately in release.yml.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
     strategy:
       fail-fast: false
       matrix:
@@ -39,19 +48,25 @@ jobs:
             Sort-Object FullName -Descending | Select-Object -First 1
           if (!$fxc) { throw 'Windows SDK shader compiler fxc.exe was not found' }
           "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
-      - if: runner.os == 'Windows'
-        run: cargo build --release --locked --manifest-path gui/Cargo.toml
-      - if: runner.os == 'Windows'
-        run: cargo test --release --locked --manifest-path gui/Cargo.toml --bin remuda-gui provider::windows_tests
-      - name: Verify Kit composer and scrollbar behavior on Windows
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          cargo test --release --locked --manifest-path gui/Cargo.toml --bin remuda-gui line_input::tests
-          cargo test --release --locked --manifest-path gui/Cargo.toml --bin remuda-gui composer_keys_edit_lines_and_restore_draft_after_recalling_history
-          cargo test --release --locked --manifest-path gui/Cargo.toml --bin remuda-gui session_sidebar_scrolls_without_scrolling_the_terminal
-      - if: runner.os == 'macOS'
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: browser-ci-${{ matrix.platform }}
+          workspaces: |
+            . -> target
+            gui -> target
+          env-vars: GPUI_FXC_PATH
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
+      - name: Build Browser
         run: cargo build --locked --manifest-path gui/Cargo.toml
+      - name: Verify Windows provider, Kit composer and scrollbar
+        if: runner.os == 'Windows'
+        run: >-
+          cargo test --locked --manifest-path gui/Cargo.toml --bin remuda-gui
+          -- provider::windows_tests line_input::tests
+          composer_keys_edit_lines_and_restore_draft_after_recalling_history
+          session_sidebar_scrolls_without_scrolling_the_terminal
       - run: cargo build --locked -p remuda-native --bin remuda
       - name: Read sessions through the Windows local node
         if: runner.os == 'Windows'
@@ -65,22 +80,24 @@ jobs:
           $daemon = Start-Process -FilePath ./target/debug/${{ matrix.cli }} -ArgumentList daemon -PassThru
           try {
             for ($attempt = 0; $attempt -lt 30; $attempt++) {
-              $sessions = & ./gui/target/release/${{ matrix.executable }} --internal-list-worker
+              $sessions = & ./gui/target/debug/${{ matrix.executable }} --internal-list-worker
               if ($LASTEXITCODE -eq 0) { break }
               Start-Sleep -Milliseconds 200
             }
             if ($LASTEXITCODE -ne 0 -or $sessions -ne '[]') { throw 'GUI could not read the local node session list' }
-            $nodes = & ./gui/target/release/${{ matrix.executable }} --internal-nodes-worker
+            $nodes = & ./gui/target/debug/${{ matrix.executable }} --internal-nodes-worker
             if ($LASTEXITCODE -ne 0 -or $nodes -ne '[]') { throw 'An unconfigured cluster should have no peer rows' }
           } finally {
             Stop-Process -Id $daemon.Id -ErrorAction SilentlyContinue
             $daemon.WaitForExit()
             Remove-Item -LiteralPath $root.FullName -Force -Recurse
           }
-      - if: runner.os == 'macOS'
-        run: cargo test --locked --manifest-path gui/Cargo.toml --bin remuda-gui drive_and_bus_open_the_same_reader_across_layouts
-      - if: runner.os == 'macOS'
-        run: cargo test --locked --manifest-path gui/Cargo.toml --bin remuda-gui peer_branches_fold_independently_and_preserve_the_preview
+      - name: Verify macOS Drive and session tree
+        if: runner.os == 'macOS'
+        run: >-
+          cargo test --locked --manifest-path gui/Cargo.toml --bin remuda-gui
+          -- drive_and_bus_open_the_same_reader_across_layouts
+          peer_branches_fold_independently_and_preserve_the_preview
       - if: runner.os == 'macOS'
         shell: bash
         run: |
@@ -93,14 +110,14 @@ jobs:
       - if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          & ./gui/target/release/${{ matrix.executable }} --internal-build-id
+          & ./gui/target/debug/${{ matrix.executable }} --internal-build-id
           if ($LASTEXITCODE -ne 0) { throw "GUI build-ID probe exited with $LASTEXITCODE" }
           & ./target/debug/${{ matrix.cli }} browser --help
           if ($LASTEXITCODE -ne 0) { throw "CLI help exited with $LASTEXITCODE" }
           & ./target/debug/${{ matrix.cli }} tray --help
           if ($LASTEXITCODE -ne 0) { throw "Tray help exited with $LASTEXITCODE" }
           New-Item -ItemType Directory browser-artifact
-          Copy-Item ./gui/target/release/${{ matrix.executable }}, ./target/debug/${{ matrix.cli }} browser-artifact/
+          Copy-Item ./gui/target/debug/${{ matrix.executable }}, ./target/debug/${{ matrix.cli }} browser-artifact/
       - uses: actions/upload-artifact@v4
         with:
           name: remuda-browser-${{ matrix.platform }}

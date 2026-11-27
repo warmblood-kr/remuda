@@ -107,8 +107,18 @@ jobs:
     runs-on: windows-latest
     # A hung test otherwise holds the runner for the 6h default.
     timeout-minutes: 30
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v4
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: windows-core-ci
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
       # The full workspace suite is main-only. Keep the Windows session-host
       # endpoint tests visible on every pull request that can change them.
       - name: Windows session-host endpoint
