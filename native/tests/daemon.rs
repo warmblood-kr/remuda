@@ -6124,6 +6124,71 @@ fn the_daemon_names_the_build_it_was_started_from() {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn doctor_reports_daemon_resolved_host_storage_without_starting_a_daemon() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = scratch_dir("doctor-host-storage");
+    let socket = daemon::socket_path_in(&dir, "s");
+    let invoke = || remuda_timed(&dir, &["-s", "s", "doctor"]);
+    let offline = invoke();
+    assert!(offline.status.success(), "{offline:?}");
+    assert!(String::from_utf8_lossy(&offline.stdout).contains("Daemon (running): not running"));
+    assert!(!socket.exists());
+
+    let state = dir.join("host-state");
+    std::fs::create_dir(&state).unwrap();
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut command = spawn::base_command(&dir);
+    command.env("REMUDA_SESSION_HOST_STATE_DIR", &state);
+    let daemon = spawn::spawn_and_wait(command, &dir);
+    let online = invoke();
+    assert!(online.status.success(), "{online:?}");
+    let report = String::from_utf8_lossy(&online.stdout);
+    assert!(report.contains(&format!(
+        "Daemon (running): {}",
+        remuda_native::dist::BUILD_VERSION
+    )));
+    assert!(
+        report.lines().any(|line| {
+            line.starts_with(&format!(
+                "Host inventory: {}/",
+                state.canonicalize().unwrap().display()
+            )) && line.ends_with("/inventory")
+        }),
+        "{report}"
+    );
+    assert!(
+        report.contains(&format!("Host sockets: {}.hosts", socket.display())),
+        "{report}"
+    );
+    drop(daemon);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn doctor_reports_legacy_inventory_beside_the_socket() {
+    let dir = scratch_dir("doctor-legacy-storage");
+    let socket = daemon::socket_path_in(&dir, "s");
+    let mut command = spawn::base_command(&dir);
+    command.env_remove("REMUDA_SESSION_HOST_STATE_DIR");
+    let daemon = spawn::spawn_and_wait(command, &dir);
+    let output = remuda_timed(&dir, &["-s", "s", "doctor"]);
+    assert!(output.status.success(), "{output:?}");
+    let report = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        report.contains(&format!(
+            "Host inventory: {}.hosts/inventory",
+            socket.display()
+        )),
+        "{report}"
+    );
+    drop(daemon);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn idle_daemon_version_requests_do_not_wait_for_a_poll_interval() {

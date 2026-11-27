@@ -315,7 +315,9 @@ fn call_response(id: Value, response: Response) -> String {
             ok_reply(id, tool_error("styled capture is not exposed over MCP"))
         }
         Response::Sync { .. } => ok_reply(id, tool_error("Sync is not exposed over MCP")),
-        Response::NodeStatus(_) => ok_reply(id, tool_error("node status is not exposed over MCP")),
+        Response::NodeStatus(_) | Response::HostStoragePaths { .. } => {
+            ok_reply(id, tool_error("node status is not exposed over MCP"))
+        }
         Response::RenderedSessionList(_) => ok_reply(
             id,
             tool_error("rendered session view is not exposed over MCP"),

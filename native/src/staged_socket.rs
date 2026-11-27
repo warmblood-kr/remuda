@@ -363,6 +363,26 @@ fn rename_noreplace_between(
 }
 
 #[cfg(target_os = "macos")]
+pub(crate) fn exchange(from_dir: &File, from: &OsStr, to_dir: &File, to: &OsStr) -> io::Result<()> {
+    let from = c_name(from)?;
+    let to = c_name(to)?;
+    // SAFETY: both directory descriptors and NUL-terminated names are live.
+    if unsafe {
+        renameatx_np(
+            from_dir.as_raw_fd(),
+            from.as_ptr(),
+            to_dir.as_raw_fd(),
+            to.as_ptr(),
+            0x0000_0002,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn renameatx_np(
         from_fd: libc::c_int,
