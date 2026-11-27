@@ -418,6 +418,8 @@ struct LocalGui {
     node_status: Option<cluster_status::ClusterStatus>,
     selected_node_status: NodeMetricsStatus,
     node_details_requested: bool,
+    force_close_notice: Option<String>,
+    session_menu: Option<(gpui::Point<gpui::Pixels>, Selection)>,
     peer_status: HashMap<String, cluster_status::PeerStatus>,
     live: Option<live_session::LiveSession>,
     live_focus: Option<gpui::FocusHandle>,
@@ -495,6 +497,8 @@ impl LocalGui {
             node_status: None,
             selected_node_status: NodeMetricsStatus::default(),
             node_details_requested: false,
+            force_close_notice: None,
+            session_menu: None,
             peer_status: HashMap::new(),
             live: None,
             live_focus: None,
@@ -1217,6 +1221,66 @@ impl LocalGui {
     }
     fn showing_node_details(&self) -> bool {
         matches!(self.focused_row, TreeRow::Node(_)) && self.node_details_requested
+    }
+
+    fn confirm_force_close(
+        &mut self,
+        selected: Selection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let peer = selected.peer.clone();
+        let name = selected.name;
+        let node_label = peer
+            .as_ref()
+            .and_then(|fp| self.peers.iter().find(|node| &node.fingerprint == fp))
+            .map_or_else(|| "This device".into(), |node| node.label.clone());
+        let confirmation = window.prompt(
+            gpui::PromptLevel::Warning,
+            &format!("Force close {name} on {node_label}?"),
+            Some("This ends the session process and its host. Unsaved work may be lost."),
+            &[
+                gpui::PromptButton::cancel("Cancel"),
+                gpui::PromptButton::ok("Force Close"),
+            ],
+            cx,
+        );
+        cx.spawn(async move |view, cx| {
+            if confirmation.await.ok() != Some(1) {
+                return;
+            }
+            let target = peer.clone().map_or_else(
+                || StatusNode::Local(remuda_native::daemon::socket_path("default")),
+                StatusNode::Peer,
+            );
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    use remuda_core::protocol::Response;
+                    match target.force_close(name.clone(), selected.instance) {
+                        Ok(Response::Ok) => format!("Force-closed {name}"),
+                        Ok(Response::RemoteControlDisabled) => {
+                            "Remote control is disabled on the host node".into()
+                        }
+                        Ok(Response::Error(error)) => error,
+                        Ok(_) => "Daemon did not confirm force close".into(),
+                        Err(error) => {
+                            format!("Force close outcome could not be confirmed: {error}")
+                        }
+                    }
+                })
+                .await;
+            let _ = view.update(cx, |this, cx| {
+                this.force_close_notice = Some(result);
+                if let Some(peer) = peer {
+                    this.refresh_peer(peer);
+                } else {
+                    this.next_session_refresh = Instant::now();
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn selected_status_target(&self) -> Option<StatusNode> {
@@ -2321,6 +2385,50 @@ mod tests {
         let keys = cx.debug_bounds("tree-help").unwrap();
         cx.simulate_click(keys.center(), gpui::Modifiers::none());
         assert!(cx.debug_bounds("tree-shortcuts").is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn right_click_on_unavailable_session_only_opens_the_context_menu(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut gui = LocalGui::new();
+            gui.preview_busy = true;
+            gui.remote_busy = true;
+            gui.local_expanded = true;
+            let mut unavailable = row("unavailable");
+            unavailable.unavailable = true;
+            gui.sessions = vec![unavailable];
+            gui
+        });
+        cx.simulate_resize(gpui::size(px(1000.), px(650.)));
+        assert!(cx.debug_bounds("session-context-menu").is_none());
+        let row = cx.debug_bounds("session-0").unwrap();
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Right,
+            position: row.center(),
+            modifiers: gpui::Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        assert!(!cx.has_pending_prompt());
+        let action = cx.debug_bounds("session-menu-force-close").unwrap();
+        assert!(cx.read(|app| {
+            let gui = view.read(app);
+            gui.force_close_notice.is_none()
+                && gui.selection.is_none()
+                && gui.sessions.len() == 1
+                && gui
+                    .session_menu
+                    .as_ref()
+                    .is_some_and(|(_, target)| target.name == "unavailable")
+        }));
+        cx.simulate_click(action.center(), gpui::Modifiers::none());
+        assert!(cx.has_pending_prompt());
+        assert!(cx.debug_bounds("session-context-menu").is_none());
+        cx.simulate_prompt_answer("Cancel");
+        assert!(cx.read(|app| view.read(app).force_close_notice.is_none()));
     }
 
     #[gpui::test]

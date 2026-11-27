@@ -355,9 +355,9 @@ fn request_timeout(request: &Request) -> std::time::Duration {
             std::time::Duration::from_millis((*timeout_ms).min(remuda_core::sync::MAX_TIMEOUT_MS))
                 + SYNC_TIMEOUT_MARGIN
         }
-        Request::InputLine { .. } | Request::RemoteInputLine { .. } => {
-            std::time::Duration::from_secs(8)
-        }
+        Request::InputLine { .. }
+        | Request::RemoteInputLine { .. }
+        | Request::ForceClose { .. } => std::time::Duration::from_secs(8),
         _ => CONNECTION_TIMEOUT,
     }
 }
@@ -380,6 +380,27 @@ fn write_response(stream: &mut crate::ipc::Stream, reply: Vec<u8>) -> std::io::R
     stream.write_all(&reply)?;
     stream.write_all(b"\n")?;
     stream.flush()
+}
+
+fn authorize_input(
+    request: &Request,
+    client_id: &str,
+    seq: u64,
+    bytes: &[u8],
+) -> Result<(), String> {
+    if matches!(
+        request,
+        Request::InputLine { .. } | Request::RemoteInputLine { .. }
+    ) && std::str::from_utf8(bytes).is_err()
+    {
+        return Err("input line must be UTF-8".into());
+    }
+    if bytes.len() > MAX_REMOTE_INPUT_BATCH_BYTES {
+        return Err(format!(
+            "remote Input batch exceeds {MAX_REMOTE_INPUT_BATCH_BYTES} bytes"
+        ));
+    }
+    validate_batch(client_id, seq, bytes).map(|_| ())
 }
 
 /// Explicit request allowlist; new variants need a policy decision.
@@ -410,21 +431,7 @@ pub fn authorize(request: &Request) -> Result<(), String> {
             seq,
             bytes,
             ..
-        } => {
-            if matches!(
-                request,
-                Request::InputLine { .. } | Request::RemoteInputLine { .. }
-            ) && std::str::from_utf8(bytes).is_err()
-            {
-                return Err("input line must be UTF-8".into());
-            }
-            if bytes.len() > MAX_REMOTE_INPUT_BATCH_BYTES {
-                return Err(format!(
-                    "remote Input batch exceeds {MAX_REMOTE_INPUT_BATCH_BYTES} bytes"
-                ));
-            }
-            validate_batch(client_id, *seq, bytes).map(|_| ())
-        }
+        } => authorize_input(request, client_id, *seq, bytes),
         Request::RenderedSessionList { .. } => Err("invalid rendered list width".into()),
         Request::RemoteInput { .. } => Err(refusal("RemoteInput")),
         Request::SetRemoteInputOptOut { .. } => Err(refusal("SetRemoteInputOptOut")),
@@ -462,6 +469,12 @@ pub fn authorize(request: &Request) -> Result<(), String> {
         Request::RemoveDirAll { .. } => Err(refusal("RemoveDirAll")),
         Request::Version => Err(refusal("Version")),
         Request::HostStoragePaths => Err(refusal("HostStoragePaths")),
+        Request::ForceClose {
+            instance_id,
+            confirm: true,
+            ..
+        } if !instance_id.is_empty() => Ok(()),
+        Request::ForceClose { .. } => Err(refusal("ForceClose")),
         Request::SessionHostReservations => Err(refusal("SessionHostReservations")),
         Request::SessionHostBuilds => Err(refusal("SessionHostBuilds")),
         Request::Reload { .. } => Err(refusal("Reload")),
@@ -885,6 +898,11 @@ mod tests {
             Request::RemoveDirAll { path: "/".into() },
             Request::Version,
             Request::HostStoragePaths,
+            Request::ForceClose {
+                name: "dev".into(),
+                instance_id: String::new(),
+                confirm: false,
+            },
             Request::ClusterRegistrySync {
                 digest: None,
                 offset: 0,

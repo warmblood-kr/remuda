@@ -636,6 +636,26 @@ impl Registry {
         removed
     }
 
+    /// Stop tracking only the confirmed session instance.
+    pub fn remove_hosted_instance(&self, name: &str, instance: &str) -> Option<Arc<SessionHandle>> {
+        let removed = {
+            let mut hosted = self.hosted_lock();
+            if !hosted
+                .get(name)
+                .is_some_and(|handle| handle.identity().instance == instance)
+            {
+                return None;
+            }
+            hosted.remove(name)
+        };
+        if let Some(handle) = &removed {
+            self.forget_hosted_input(handle);
+            self.forget_remote_input_policy(instance);
+            self.forget_team(instance);
+        }
+        removed
+    }
+
     fn forget_hosted_input(&self, handle: &SessionHandle) {
         self.hosted_input
             .lock()

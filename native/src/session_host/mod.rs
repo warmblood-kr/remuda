@@ -14,6 +14,8 @@ mod control;
 mod coordinator;
 #[cfg(unix)]
 mod entry;
+#[cfg(target_os = "macos")]
+mod force_close;
 #[cfg(unix)]
 mod gate;
 #[cfg(unix)]

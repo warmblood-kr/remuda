@@ -1116,7 +1116,7 @@ fn authorize_remote_request_with_source(
 ) -> Result<(), Response> {
     let enabled = if matches!(
         request,
-        Request::ResizeSession { .. } | Request::Close { .. }
+        Request::ResizeSession { .. } | Request::Close { .. } | Request::ForceClose { .. }
     ) {
         control_source.enabled().map_err(|_| {
             let operation = if matches!(request, Request::ResizeSession { .. }) {
@@ -1142,7 +1142,7 @@ fn authorize_remote_request_with_control(
         Request::ResizeSession { .. } if !allow_remote_control => {
             return Err(Response::RemoteControlDisabled);
         }
-        Request::Close { .. } if !allow_remote_control => {
+        Request::Close { .. } | Request::ForceClose { .. } if !allow_remote_control => {
             return Err(Response::RemoteControlDisabled);
         }
         _ => {}
@@ -2701,6 +2701,34 @@ mod tests {
             Response::RemoteControlDisabled,
             0,
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn force_close_requires_enabled_remote_control_and_confirmation() {
+        for (enabled, confirmed, expected, dispatches) in [
+            (false, true, Response::RemoteControlDisabled, 0),
+            (
+                true,
+                false,
+                Response::error("remote front refuses ForceClose"),
+                0,
+            ),
+            (true, true, Response::Ok, 1),
+        ] {
+            let config = format!(r#"{{"allow_remote_control":{enabled}}}"#);
+            production_socket_close_response(
+                config.as_bytes(),
+                Request::ForceClose {
+                    name: "session".into(),
+                    instance_id: "exact-instance".into(),
+                    confirm: confirmed,
+                },
+                Response::Ok,
+                expected,
+                dispatches,
+            );
+        }
     }
 
     #[cfg(unix)]

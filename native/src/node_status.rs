@@ -233,16 +233,29 @@ impl Node {
                 &Request::NodeStatus,
                 Duration::from_secs(2),
             ),
-            Self::Peer(peer) => request_peer(&peer),
+            Self::Peer(peer) => request_peer(&peer, &Request::NodeStatus, Duration::from_secs(2)),
         }?;
         match response {
             Response::NodeStatus(sample) => Ok(sample),
             _ => Err(io::Error::other("node status unavailable")),
         }
     }
+
+    pub fn force_close(self, name: String, instance_id: String) -> io::Result<Response> {
+        let request = Request::ForceClose {
+            name,
+            instance_id,
+            confirm: true,
+        };
+        let timeout = Duration::from_secs(8);
+        match self {
+            Self::Local(path) => crate::client::request_with_timeout(&path, &request, timeout),
+            Self::Peer(peer) => request_peer(&peer, &request, timeout),
+        }
+    }
 }
 
-fn request_peer(peer: &str) -> io::Result<Response> {
+fn request_peer(peer: &str, request: &Request, timeout: Duration) -> io::Result<Response> {
     let resolve = || match resolve_call(peer, None)? {
         ResolvedCall::Remote {
             fingerprint,
@@ -254,8 +267,8 @@ fn request_peer(peer: &str) -> io::Result<Response> {
     let (address, pinned_key) = resolve()?;
     let private_key = crate::cluster::identity::load_static_private_key()?;
     let response = crate::net::cluster_client::ClusterClient::system()
-        .with_request_timeout(Duration::from_secs(2))
-        .request(address, &pinned_key, &private_key, &Request::NodeStatus)
+        .with_request_timeout(timeout)
+        .request(address, &pinned_key, &private_key, request)
         .map_err(io::Error::other)?;
     if resolve()? != (address, pinned_key) {
         return Err(io::Error::other("node identity changed"));

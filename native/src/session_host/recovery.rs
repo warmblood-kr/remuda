@@ -381,6 +381,42 @@ impl Owner {
         super::unix::remove_owner_record(endpoint, &entry.identity);
         Ok(true)
     }
+    /// Called only after OS-confirmed termination of both verified processes.
+    #[cfg(target_os = "macos")]
+    pub(super) fn retire_force_closed(&self, target: &Target) -> Result<(), Error> {
+        let until = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let index = self.store.read()?;
+            let Some(entry) = index.entries.get(&target.name) else {
+                return Ok(());
+            };
+            if entry.identity != target.identity {
+                return Err(Error::Data(model::Error::Conflict));
+            }
+            let result = self.store.commit(
+                index.cursor(),
+                Some(self.fence()),
+                Mutation::Exit {
+                    target: Target {
+                        name: target.name.clone(),
+                        identity: target.identity.clone(),
+                    },
+                    operation: model::ExitMutation::RetireDead {
+                        launch: entry.launch,
+                    },
+                },
+                Duration::from_millis(200),
+            );
+            match result {
+                Ok(_) => return Ok(()),
+                Err(Error::Data(model::Error::Conflict)) if std::time::Instant::now() < until => {
+                    continue
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Publish that the caller received this exact result; then it may be GC'd.
     pub fn consume(
         &self,

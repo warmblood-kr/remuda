@@ -716,6 +716,26 @@ impl LocalGui {
                             }),
                     )
                     .tooltip(move |_, app| app.new(|_| FullName(full_name.clone())).into());
+                if session.alive
+                    && !unavailable
+                    && self.ssh.is_none()
+                    && (fp.is_some() || cfg!(target_os = "macos"))
+                {
+                    if let Some(instance) = session.instance_id.clone() {
+                        let target = Selection {
+                            peer: fp.clone(),
+                            name: session.name.clone(),
+                            instance,
+                        };
+                        item = item.on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                this.session_menu = Some((event.position, target.clone()));
+                                cx.notify();
+                            }),
+                        );
+                    }
+                }
                 if openable {
                     item = item
                         .cursor_pointer()
@@ -1038,9 +1058,14 @@ impl Render for LocalGui {
             .text_color(rgb(0xe8eaf0))
             .when(cfg!(target_os = "macos"), |root| root.font_family("Menlo"))
             // Leave the PTY's plain Tab and Shift+Tab handling intact.
-            .capture_key_down(|event, window, cx| {
-                crate::workspace_tab_navigation(event, window, cx, true)
-            })
+            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" && this.session_menu.take().is_some() {
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                crate::workspace_tab_navigation(event, window, cx, true);
+            }))
             .on_key_down(|event, window, cx| {
                 crate::workspace_tab_navigation(event, window, cx, false)
             })
@@ -1499,6 +1524,34 @@ impl Render for LocalGui {
                             .when_some(document, |d, doc| d.child(doc)),
                     ),
             )
+            .when_some(self.session_menu.clone(), |root, (position, target)| {
+                root.child(gpui::deferred(gpui::anchored().position(position).child(
+                    div()
+                        .id("session-context-menu")
+                        .debug_selector(|| "session-context-menu".into())
+                        .p_1()
+                        .bg(rgb(0x252d38))
+                        .border_1()
+                        .border_color(rgb(0x354454))
+                        .rounded_md()
+                        .on_mouse_down_out(cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                            if event.button == MouseButton::Left {
+                                this.session_menu = None;
+                                cx.notify();
+                            }
+                        }))
+                        .child(action_button("session-menu-force-close", "Force Close…", false)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.session_menu = None;
+                                this.confirm_force_close(target.clone(), window, cx);
+                                cx.notify();
+                            }))),
+                )))
+            })
+            .when_some(self.force_close_notice.as_ref(), |root, notice| {
+                root.child(div().absolute().bottom_2().left_2().px_2().py_1()
+                    .bg(rgb(0x252d38)).text_sm().child(notice.clone()))
+            })
     }
 }
 
@@ -1530,9 +1583,10 @@ fn tab(
         .child(text)
 }
 
-fn action_button(id: &'static str, text: &'static str, emphasized: bool) -> Button {
-    Button::new(id)
-        .debug_selector(move || id.into())
+fn action_button(id: impl Into<SharedString>, text: &'static str, emphasized: bool) -> Button {
+    let id = id.into();
+    Button::new(id.clone())
+        .debug_selector(move || id.to_string())
         .flex_none()
         .px_2()
         .py_1()
