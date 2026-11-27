@@ -66,6 +66,29 @@ mod macos {
     }
 
     #[test]
+    fn browser_launches_local_discovery_or_explicit_ssh_without_starting_a_daemon() {
+        let scratch = Scratch::new("browser-entry");
+        scratch.install_cli();
+        let gui = scratch.0.join("remuda-gui");
+        std::fs::write(&gui, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+        std::fs::set_permissions(&gui, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        for (args, expected) in [
+            (&["browser"][..], "--browser-auto\n"),
+            (&["browser", "--gui"][..], "--browser-auto\n"),
+            (
+                &["browser", "--gui", "user@remote"][..],
+                "--browser\nuser@remote\n",
+            ),
+        ] {
+            let output = scratch.command().args(args).output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+            scratch.assert_untouched();
+        }
+    }
+
+    #[test]
     fn managed_gui_stays_on_physical_build_path_during_cli_replacement() {
         let scratch = Scratch::new("managed-running");
         scratch.install_cli();

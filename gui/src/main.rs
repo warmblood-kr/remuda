@@ -40,6 +40,27 @@ mod windows_icon;
 mod windows_input;
 
 const WORKER_ABI: &str = "--remuda-gui-worker-abi-1";
+gpui_kit::assets::icon_assets!(
+    WorkspaceIcons,
+    [
+        ChevronDown,
+        ChevronRight,
+        Close,
+        Database,
+        File,
+        FileCode,
+        FileImage,
+        FileText,
+        Folder,
+        Maximize,
+        MessageSquare,
+        Minimize,
+        RefreshCw,
+        Scan,
+        ZoomIn,
+    ]
+);
+
 const PREVIEW_ABI: &str = "--remuda-gui-preview-abi-2";
 const STALE_HELPER: &str = "GUI helper version changed; restart the GUI";
 
@@ -406,6 +427,7 @@ struct LocalGui {
     attention_focus: Option<gpui::FocusHandle>,
     keys_focus: Option<gpui::FocusHandle>,
     session_action_focus: Option<gpui::FocusHandle>,
+    terminal_layout_focus: Option<gpui::FocusHandle>,
     documents: Option<gpui::Entity<browser::Browser>>,
     drive_selected: bool,
     live_notice: Option<&'static str>,
@@ -482,6 +504,7 @@ impl LocalGui {
             attention_focus: None,
             keys_focus: None,
             session_action_focus: None,
+            terminal_layout_focus: None,
             documents: None,
             drive_selected: false,
             live_notice: None,
@@ -624,7 +647,7 @@ impl LocalGui {
 
     fn open_session_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(docs) = &self.documents {
-            docs.update(cx, |docs, cx| docs.select_terminal(cx));
+            docs.update(cx, |docs, cx| docs.focus_terminal_for_input(window, cx));
         }
         if self.line_input.is_some() && self.live.is_some() {
             self.focus_terminal_input(window, cx);
@@ -661,8 +684,7 @@ impl LocalGui {
                     self.live = Some(live);
                     self.line_input = history
                         .map(|history| line_input::LineInput::with_history(history, window, cx));
-                    self.live_notice =
-                        (!compose).then_some("Direct input enabled · Ctrl+\\ detaches");
+                    self.live_notice = None;
                     self.next_live_preview = Instant::now();
                     self.focus_terminal_input(window, cx);
                 }
@@ -908,6 +930,7 @@ impl LocalGui {
         let reading_document = self.documents.as_ref().is_some_and(|docs| {
             let docs = docs.read(cx);
             docs.owns_document_focus(window, cx)
+                || docs.maximized() == Some(browser::Content::Document)
                 || (!browser::Browser::wide(window) && docs.showing_document())
         });
         // Focusing a workspace control does not activate another pane.
@@ -918,6 +941,7 @@ impl LocalGui {
             &self.attention_focus,
             &self.keys_focus,
             &self.session_action_focus,
+            &self.terminal_layout_focus,
         ]
         .into_iter()
         .flatten()
@@ -945,7 +969,7 @@ impl LocalGui {
         if let Some(live) = &self.live {
             match live.poll() {
                 Some(live_session::Event::Applied) => {
-                    self.live_notice = Some("Input sent · Ctrl+\\ detaches");
+                    self.live_notice = None;
                     self.next_live_preview = Instant::now();
                 }
                 Some(live_session::Event::PasteUnavailable) => {
@@ -1355,6 +1379,19 @@ fn main() {
         return;
     }
     #[cfg(any(target_os = "macos", windows))]
+    if std::env::args().nth(1).as_deref() == Some("--browser-auto") {
+        use remuda_core::protocol::{Request, Response};
+        let local = remuda_native::client::request_with_timeout(
+            &remuda_native::daemon::socket_path("default"),
+            &Request::Version,
+            std::time::Duration::from_secs(1),
+        );
+        if !matches!(local, Ok(Response::Value(_))) {
+            tray::pick_browser();
+            return;
+        }
+    }
+    #[cfg(any(target_os = "macos", windows))]
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--browser-picker")) {
         tray::pick_browser();
         return;
@@ -1458,7 +1495,7 @@ fn main() {
             }
         };
         let window = Rc::new(Cell::new(None));
-        let app = gpui_kit::application();
+        let app = gpui_kit::application().with_assets(WorkspaceIcons);
         let reopen = window.clone();
         app.on_reopen(move |cx| show_local_window(&reopen, cx));
         app.run(move |cx| {
@@ -1478,7 +1515,7 @@ fn main() {
     }
     #[cfg(windows)]
     native_document::configure_platform();
-    let app = gpui_kit::application();
+    let app = gpui_kit::application().with_assets(WorkspaceIcons);
     #[cfg(target_os = "macos")]
     app.on_reopen(|cx| {
         if let Some(window) = cx.windows().first().copied() {
@@ -1908,7 +1945,45 @@ mod tests {
         assert!(cx.debug_bounds("document-split-divider").is_none());
         cx.simulate_resize(gpui::size(px(1120.), px(720.)));
         assert_eq!(cx.debug_bounds("browser-document-body").unwrap(), resized);
-        let terminal = cx.debug_bounds("local-terminal-tab").unwrap();
+
+        assert!(cx.debug_bounds("local-terminal-tab").is_none());
+        let session = cx.debug_bounds("session-pane").unwrap();
+        let maximize = cx.debug_bounds("terminal-layout").unwrap();
+        cx.simulate_click(maximize.center(), gpui::Modifiers::none());
+        assert!(cx.debug_bounds("browser-document-body").is_none());
+        assert!(cx.debug_bounds("document-split-divider").is_none());
+        assert!(cx.debug_bounds("session-pane").unwrap().size.width > session.size.width);
+        let restore = cx.debug_bounds("terminal-layout").unwrap();
+        cx.simulate_click(restore.center(), gpui::Modifiers::none());
+        assert_eq!(
+            cx.debug_bounds("session-pane").unwrap().size.width,
+            session.size.width
+        );
+
+        let maximize = cx.debug_bounds("document-layout").unwrap();
+        cx.simulate_click(maximize.center(), gpui::Modifiers::none());
+        assert!(cx.debug_bounds("session-pane").is_none());
+        assert!(cx.debug_bounds("document-split-divider").is_none());
+        assert!(cx.debug_bounds("browser-document-body").unwrap().size.width > resized.size.width);
+        view.update_in(cx, |gui, window, cx| {
+            assert!(gui
+                .documents
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .owns_document_focus(window, cx));
+            gui.tick(window, cx);
+            assert!(gui.live.is_some());
+            assert_eq!(
+                gui.line_input.as_ref().unwrap().bytes(cx).unwrap(),
+                b"draft\r"
+            );
+        });
+        let restore = cx.debug_bounds("document-layout").unwrap();
+        cx.simulate_click(restore.center(), gpui::Modifiers::none());
+        assert_eq!(cx.debug_bounds("browser-document-body").unwrap(), resized);
+
+        let terminal = cx.debug_bounds("terminal-layout").unwrap();
         cx.simulate_click(terminal.center(), gpui::Modifiers::none());
         assert!(cx.debug_bounds("browser-document-body").is_none());
         assert!(cx.debug_bounds("session-pane").is_some());

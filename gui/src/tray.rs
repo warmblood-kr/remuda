@@ -210,7 +210,7 @@ fn open_remuda() {
 }
 
 fn open_browser() {
-    launch(&["--browser-picker"]);
+    launch(&["--browser-auto"]);
 }
 
 fn launch(args: &[&str]) {

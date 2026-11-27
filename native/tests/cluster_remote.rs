@@ -1640,6 +1640,178 @@ fn wait_for(label: &str, timeout: Duration, mut ready: impl FnMut() -> bool) {
 }
 
 #[test]
+fn remote_tui_browses_drive_and_preserves_the_terminal_draft() {
+    let fixture = BrowserRelayFixture::new(false);
+    let path = fixture.ingress.root.join("tui-drive-review.md");
+    let document = b"# Review\nDrive-document\n";
+    fs::write(&path, document).unwrap();
+    put_fixture_doc(&fixture.ingress, &path, "remuda:///docs/review.md", false);
+    fixture
+        .egress
+        .start_named_session("proof", "printf 'DRIVE-TERMINAL\\n'; sleep 30");
+
+    let target = format!("{}/proof", fixture.egress.fingerprint());
+    let mut tui = RemoteTui::start_at_size(&fixture.ingress, Some(&target), 144, 24);
+    let timeout = Duration::from_secs(8);
+    tui.wait_for("DRIVE-TERMINAL", timeout);
+    tui.writer.write_all(b"keep-my-draft").unwrap();
+    tui.wait_for("keep-my-draft", timeout);
+    tui.writer.write_all(b"\x1b").unwrap();
+    tui.wait_for("d Drive", timeout);
+    // Wait for the composer to stop displaying the draft before sending the sidebar key.
+    wait_for("composer returned to workspace navigation", timeout, || {
+        !tui.screen_text().contains("keep-my-draft")
+    });
+    tui.writer.write_all(b"d").unwrap();
+    tui.wait_for("▸ docs", timeout);
+    tui.writer.write_all(b"\r").unwrap();
+    tui.wait_for("review.md", timeout);
+    tui.wait_for(&format!("{} B", document.len()), timeout);
+    tui.writer.write_all(b"\x1b[B\r").unwrap();
+    tui.wait_for("Drive-document", timeout);
+    assert!(tui.screen_text().contains("DRIVE-TERMINAL"));
+
+    tui.writer.write_all(b"z").unwrap();
+    wait_for("Drive document maximized", timeout, || {
+        let screen = tui.screen_text();
+        screen.contains("Drive-document") && !screen.contains("DRIVE-TERMINAL")
+    });
+    tui.writer.write_all(b"z").unwrap();
+    wait_for("Drive document restored beside terminal", timeout, || {
+        let screen = tui.screen_text();
+        screen.contains("Drive-document") && screen.contains("DRIVE-TERMINAL")
+    });
+    tui.writer.write_all(b"\x1b").unwrap();
+    wait_for("Drive reader closed", timeout, || {
+        !tui.screen_text().contains("Drive-document")
+    });
+    tui.writer.write_all(b"d").unwrap();
+    tui.wait_for("d Drive", timeout);
+    assert!(!tui.screen_text().contains("review.md"));
+    tui.writer.write_all(b"\r").unwrap();
+    tui.wait_for("keep-my-draft", timeout);
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one PTY workflow checks both panels, the draft, and raw input"
+)]
+fn remote_tui_linked_file_restores_both_panes() {
+    let fixture = BrowserRelayFixture::new(false);
+    let work = fixture.egress.root.join("workdir");
+    fs::create_dir(&work).unwrap();
+    let path = work.join("review.md");
+    let document = (0..40)
+        .map(|line| format!("DOC-{line:02}\n"))
+        .collect::<String>();
+    fs::write(&path, document).unwrap();
+    let uri = url::Url::from_file_path(path).unwrap();
+    let script = format!(
+        "stty -echo; printf 'TERM-SOURCE\\n\\033]8;;%s\\007OPEN-REVIEW\\033]8;;\\007\\n' '{}'; IFS= read -r line; printf 'DIRECT:%s\\n' \"$line\"; sleep 30",
+        uri.as_str(),
+    );
+    let lua = format!(
+        "remuda.session.new('proof', {{'/bin/sh', '-c', {}}}, {})",
+        serde_json::to_string(&script).unwrap(),
+        serde_json::to_string(&work).unwrap(),
+    );
+    let launch = fixture
+        .egress
+        .command()
+        .args(["-e", &lua])
+        .output()
+        .unwrap();
+    assert!(launch.status.success(), "{launch:?}");
+
+    let target = format!("{}/proof", fixture.egress.fingerprint());
+    let mut tui = RemoteTui::start_at_size(&fixture.ingress, Some(&target), 144, 24);
+    let timeout = Duration::from_secs(8);
+    tui.wait_for("OPEN-REVIEW", timeout);
+    tui.writer.write_all(b"draft-keep").unwrap();
+    tui.wait_for("draft-keep", timeout);
+    let screen = tui.screen_text();
+    let (row, col) = screen
+        .lines()
+        .enumerate()
+        .find_map(|(row, line)| {
+            line.find("OPEN-REVIEW").map(|col| {
+                (
+                    row + 1,
+                    unicode_width::UnicodeWidthStr::width(&line[..col]) + 1,
+                )
+            })
+        })
+        .expect("linked terminal cell");
+    write!(tui.writer, "\x1b[<0;{col};{row}M\x1b[<0;{col};{row}m").unwrap();
+    tui.wait_for("DOC-00", timeout);
+    let doc_column = |screen: &str| {
+        screen.lines().find_map(|line| {
+            line.find("DOC-01")
+                .map(|index| unicode_width::UnicodeWidthStr::width(&line[..index]))
+        })
+    };
+    let split = tui.screen_text();
+    let split_col = doc_column(&split).unwrap();
+    assert!(split.contains("TERM-SOURCE") && split.contains("draft-keep"));
+
+    tui.writer.write_all(b"\x1b[Bz").unwrap();
+    wait_for("document maximized and scrolled", timeout, || {
+        let screen = tui.screen_text();
+        !screen.contains("TERM-SOURCE")
+            && !screen.contains("DOC-00")
+            && doc_column(&screen).is_some_and(|col| col < split_col)
+            && screen.contains("z restore split")
+    });
+    tui.writer.write_all(b"z").unwrap();
+    wait_for(
+        "document split restored at the same offset",
+        timeout,
+        || {
+            let screen = tui.screen_text();
+            screen.contains("TERM-SOURCE")
+                && screen.contains("draft-keep")
+                && !screen.contains("DOC-00")
+                && doc_column(&screen) == Some(split_col)
+        },
+    );
+
+    // In the composer, z is draft text. Escape leaves it intact.
+    tui.writer.write_all(b"\tz").unwrap();
+    tui.wait_for("draft-keepz", timeout);
+    tui.writer.write_all(b"\x1b").unwrap();
+    tui.wait_for("z maximize pane", timeout);
+    tui.writer.write_all(b"z").unwrap();
+    wait_for("terminal maximized", timeout, || {
+        let screen = tui.screen_text();
+        screen.contains("TERM-SOURCE")
+            && !screen.contains("DOC-01")
+            && screen.contains("z restore split")
+    });
+    tui.writer.write_all(b"z").unwrap();
+    wait_for(
+        "terminal split restored at the same divider",
+        timeout,
+        || {
+            let screen = tui.screen_text();
+            screen.contains("TERM-SOURCE") && doc_column(&screen) == Some(split_col)
+        },
+    );
+    tui.writer.write_all(b"\r").unwrap();
+    tui.wait_for("Terminal input", timeout);
+    tui.wait_for("draft-keepz", timeout);
+
+    // The same z reaches the exact PTY when the terminal accepts raw keys.
+    tui.writer.write_all(b"\x1b").unwrap();
+    tui.wait_for("z maximize pane", timeout);
+    tui.writer.write_all(b"k").unwrap();
+    tui.wait_for("KEYS ", timeout);
+    tui.writer.write_all(b"z\r").unwrap();
+    tui.wait_for("DIRECT:z", timeout);
+    assert!(tui.screen_text().contains("DOC-01"));
+}
+
+#[test]
 #[allow(
     clippy::too_many_lines,
     reason = "one end-to-end source, transport, and viewer scenario"

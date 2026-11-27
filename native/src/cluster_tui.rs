@@ -81,6 +81,7 @@ const REMOTE_PARTIAL_INPUT_NOTICE: &str =
     "partial input may remain at the remote prompt; your new line would be appended to the leftover fragment and run with it — confirm sending again to send anyway";
 pub mod composer;
 pub mod confirm;
+mod drive;
 pub mod ended;
 pub mod queue;
 pub mod remote_calls;
@@ -218,6 +219,7 @@ pub struct ClusterUi {
     resize_in_flight: bool,
     remote_input_in_flight: bool,
     remote_control_disabled: HashSet<String>,
+    drive: Option<drive::Sidebar>,
     // `render` is &self, so the help mode keeps its state in cells.
     help_open: std::cell::Cell<bool>,
     help_scroll: std::cell::Cell<usize>,
@@ -591,6 +593,7 @@ impl ClusterUi {
             resize_in_flight: false,
             remote_input_in_flight: false,
             remote_control_disabled: HashSet::new(),
+            drive: None,
             help_open: std::cell::Cell::new(false),
             help_scroll: std::cell::Cell::new(0),
         }
@@ -1430,6 +1433,10 @@ impl ClusterUi {
 
     /// Cluster header, local node and remote nodes as one virtual tree (first 2 rows are the header).
     fn tree_lines(&self, width: usize, now: Duration) -> Vec<String> {
+        if let Some(sidebar) = self.drive.as_ref().filter(|sidebar| sidebar.visible) {
+            return sidebar.lines(width);
+        }
+
         let mut frame = Vec::new();
         let reachable = 1 + self
             .remote_snapshot
@@ -1477,6 +1484,10 @@ impl ClusterUi {
     }
 
     fn tree_width(&self, width: usize, now: Duration) -> usize {
+        if self.drive.as_ref().is_some_and(|sidebar| sidebar.visible) {
+            return 28;
+        }
+
         let wanted = self
             .tree_lines(48, now)
             .iter()
@@ -3209,11 +3220,21 @@ impl ClusterUi {
         lines
     }
 
-    /// The one footer affordance: the bound help key and its label.
+    /// The bound help key and any available sidebar switch.
     fn help_hint(&self) -> String {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let hint = self.keymap.display_help("cluster.tree", &["cluster.help"]);
-        if hint.is_empty() {
+        let hint = if hint.is_empty() {
             "? help".into()
+        } else {
+            hint
+        };
+        let drive_key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE);
+        if self.drive.as_ref().is_some_and(|sidebar| !sidebar.visible)
+            && self.keymap.resolve("cluster.tree", drive_key).is_none()
+            && self.keymap.resolve("cluster.runtime", drive_key).is_none()
+        {
+            format!("d Drive · {hint}")
         } else {
             hint
         }
@@ -4469,80 +4490,397 @@ impl Drop for FileMouseCapture {
     }
 }
 
-struct LinkedFilePreview {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreviewPane {
+    Terminal,
+    Document,
+}
+
+#[derive(Clone, Copy)]
+enum PreviewLayout {
+    Split {
+        terminal_cols: u16,
+        document_cols: u16,
+    },
+    Terminal,
+    Document {
+        tree_cols: u16,
+        document_cols: u16,
+    },
+}
+
+impl PreviewLayout {
+    fn terminal_cols(self, cols: u16) -> Option<u16> {
+        match self {
+            Self::Split { terminal_cols, .. } => Some(terminal_cols),
+            Self::Terminal => Some(cols),
+            Self::Document { .. } => None,
+        }
+    }
+}
+
+struct DocumentPreview {
     result: mpsc::Receiver<Result<String, String>>,
     content: Option<Result<String, String>>,
     offset: usize,
+    focus: PreviewPane,
+    maximized: Option<PreviewPane>,
+    origin: Option<RemoteSelection>,
+    title: String,
 }
 
-impl LinkedFilePreview {
+impl DocumentPreview {
+    fn load_link(origin: RemoteSelection, uri: String, loading: Arc<AtomicBool>) -> Option<Self> {
+        let RemoteSelection::Session {
+            node,
+            wire_name,
+            instance_id,
+            ..
+        } = origin.clone()
+        else {
+            return None;
+        };
+        Self::load("Linked file".into(), Some(origin), loading, move || {
+            crate::net::browser::read_cluster_session_file(&node, &wire_name, &instance_id, &uri)
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn load_drive(uri: String, size: Option<u64>, loading: Arc<AtomicBool>) -> Option<Self> {
+        const MAX_PREVIEW_BYTES: u64 = 1024 * 1024;
+        let title = uri.rsplit('/').next().unwrap_or(&uri).to_owned();
+        Self::load(title, None, loading, move || {
+            if size.is_some_and(|size| size > MAX_PREVIEW_BYTES) {
+                return Err("Text preview is limited to 1 MiB.".into());
+            }
+            let bytes =
+                crate::net::browser::read_local_drive(&uri).map_err(|error| error.to_string())?;
+            if bytes.len() as u64 > MAX_PREVIEW_BYTES {
+                return Err("Text preview is limited to 1 MiB.".into());
+            }
+            Ok(bytes)
+        })
+    }
+
     fn load(
-        node: String,
-        session: String,
-        instance: String,
-        uri: String,
+        title: String,
+        origin: Option<RemoteSelection>,
         loading: Arc<AtomicBool>,
+        read: impl FnOnce() -> Result<Vec<u8>, String> + Send + 'static,
     ) -> Option<Self> {
         if loading.swap(true, Ordering::AcqRel) {
             return None;
         }
         let (send, result) = mpsc::sync_channel(1);
-        std::thread::spawn(move || {
-            let content =
-                crate::net::browser::read_cluster_session_file(&node, &session, &instance, &uri)
-                    .map_err(|error| error.to_string())
-                    .and_then(|bytes| {
-                        String::from_utf8(bytes)
-                            .map_err(|_| "This file needs a graphical document viewer.".to_owned())
-                    });
-            let _ = send.send(content);
+        let finished = loading.clone();
+        if std::thread::Builder::new()
+            .name("cluster-document".into())
+            .spawn(move || {
+                let content = read().and_then(|bytes| {
+                    String::from_utf8(bytes)
+                        .map_err(|_| "This file needs a graphical document viewer.".to_owned())
+                });
+                let _ = send.send(content);
+                finished.store(false, Ordering::Release);
+            })
+            .is_err()
+        {
             loading.store(false, Ordering::Release);
-        });
+            return None;
+        }
         Some(Self {
             result,
             content: None,
             offset: 0,
+            focus: PreviewPane::Document,
+            maximized: None,
+            origin,
+            title,
         })
     }
 
-    fn frame(&mut self, cols: u16, rows: u16) -> String {
+    fn layout(&self, ui: &ClusterUi, cols: u16, now: Duration) -> PreviewLayout {
+        const MIN_DOCUMENT_COLS: u16 = 28;
+        let document_cols = (cols / 3).max(MIN_DOCUMENT_COLS);
+        let terminal_cols = cols.saturating_sub(document_cols + 1);
+        let can_split = usize::from(terminal_cols) >= SPLIT_MIN_COLS;
+        match self
+            .maximized
+            .or_else(|| (!can_split).then_some(self.focus))
+        {
+            None => PreviewLayout::Split {
+                terminal_cols,
+                document_cols,
+            },
+            Some(PreviewPane::Terminal) => PreviewLayout::Terminal,
+            Some(PreviewPane::Document) => {
+                let tree_cols = if usize::from(cols) >= SPLIT_MIN_COLS {
+                    ui.tree_width(usize::from(cols), now) as u16
+                } else {
+                    0
+                };
+                let document_cols = cols - tree_cols - u16::from(tree_cols != 0);
+                PreviewLayout::Document {
+                    tree_cols,
+                    document_cols,
+                }
+            }
+        }
+    }
+
+    fn document_lines(&mut self, cols: u16, rows: u16) -> Vec<String> {
         if self.content.is_none() {
             self.content = self.result.try_recv().ok();
         }
-        let hint = truncate("Linked file · ↑/↓ scroll · Esc back", cols as usize);
+        let header = if self.focus == PreviewPane::Document {
+            "> "
+        } else {
+            ""
+        };
+        let title = crate::text::strip_terminal_controls(&self.title);
+        let header = format!("{header}{title}");
         let body = match &self.content {
             Some(Ok(body)) => body.as_str(),
             Some(Err(error)) => error,
             None => "Loading from the source node…",
         };
-        let height = rows.saturating_sub(2) as usize;
-        self.offset = self.offset.min(body.lines().count().saturating_sub(height));
-        let mut frame = vec![hint, String::new()];
-        frame.extend(
-            body.lines()
-                .skip(self.offset)
-                .take(height)
-                .map(|line| truncate(&crate::text::strip_terminal_controls(line), cols as usize)),
-        );
-        frame.join("\n")
+        let height = usize::from(rows.saturating_sub(2));
+        let offset = self.offset.min(body.lines().count().saturating_sub(height));
+        let mut frame = vec![truncate(&header, usize::from(cols)), String::new()];
+        frame.extend(body.lines().skip(offset).take(height).map(|line| {
+            truncate(
+                &crate::text::strip_terminal_controls(line),
+                usize::from(cols),
+            )
+        }));
+        frame
     }
 
-    fn event(&mut self, event: crossterm::event::Event, rows: u16) -> bool {
-        use crossterm::event::{Event, KeyCode, KeyEventKind};
-        let Event::Key(key) = event else { return false };
+    fn terminal_navigation(ui: &ClusterUi) -> bool {
+        ui.remote_keys_mode.is_none()
+            && !ui.composer_focused
+            && ui.query.is_none()
+            && !ui.help_open.get()
+            && !ui.confirmation.pending()
+    }
+
+    fn frame(
+        &mut self,
+        layout: PreviewLayout,
+        ui: &ClusterUi,
+        cols: u16,
+        rows: u16,
+        screen: &str,
+        clock: &dyn Clock,
+    ) -> String {
+        let body_rows = rows.saturating_sub(1).max(1);
+        let now = clock.now();
+        let mut lines = match layout {
+            PreviewLayout::Split {
+                terminal_cols,
+                document_cols,
+            } => {
+                let terminal = ui.render(terminal_cols, body_rows, screen, clock);
+                let document = self.document_lines(document_cols, body_rows);
+                join_preview_columns(terminal.lines(), terminal_cols, document, body_rows)
+            }
+            PreviewLayout::Terminal => ui
+                .render(cols, body_rows, screen, clock)
+                .lines()
+                .map(str::to_owned)
+                .collect(),
+            PreviewLayout::Document {
+                tree_cols,
+                document_cols,
+            } => {
+                let document = self.document_lines(document_cols, body_rows);
+                if tree_cols == 0 {
+                    document
+                } else {
+                    let tree = scroll_tree_to_selection(
+                        ui.tree_lines(usize::from(tree_cols), now),
+                        usize::from(body_rows),
+                    );
+                    join_preview_columns(
+                        tree.iter().map(String::as_str),
+                        tree_cols,
+                        document,
+                        body_rows,
+                    )
+                }
+            }
+        };
+        if rows > 1 {
+            lines.resize(usize::from(body_rows), String::new());
+            let hint = if self.focus == PreviewPane::Terminal && !Self::terminal_navigation(ui) {
+                "Terminal input"
+            } else if self.maximized.is_some() {
+                "z restore split"
+            } else {
+                "z maximize pane · Tab switch pane"
+            };
+            let hint = if self.focus == PreviewPane::Document {
+                format!("{hint} · ↑/↓ scroll · Esc back")
+            } else {
+                hint.to_owned()
+            };
+            lines.push(truncate(&hint, usize::from(cols)));
+        } else {
+            lines.truncate(1);
+        }
+        lines.join("\n")
+    }
+
+    /// Returns whether the workspace consumed the event and whether to close the preview.
+    fn event(
+        &mut self,
+        event: &crossterm::event::Event,
+        ui: &ClusterUi,
+        rows: u16,
+    ) -> (bool, bool) {
+        use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+        let document_focused = self.focus == PreviewPane::Document;
+        let Event::Key(key) = event else {
+            return (document_focused, false);
+        };
         if key.kind != KeyEventKind::Press {
-            return false;
+            return (document_focused, false);
         }
-        let page = rows.saturating_sub(2).max(1) as usize;
+        if !document_focused {
+            let terminal_binding = ui.keymap.resolve("cluster.tree", *key).is_some()
+                || ui.keymap.resolve("cluster.runtime", *key).is_some();
+            if !Self::terminal_navigation(ui) || terminal_binding {
+                return (false, false);
+            }
+        }
+        if key.modifiers != KeyModifiers::NONE {
+            return (document_focused, false);
+        }
         match key.code {
-            KeyCode::Esc => return true,
-            KeyCode::Up => self.offset = self.offset.saturating_sub(1),
-            KeyCode::Down => self.offset = self.offset.saturating_add(1),
-            KeyCode::PageUp => self.offset = self.offset.saturating_sub(page),
-            KeyCode::PageDown => self.offset = self.offset.saturating_add(page),
-            _ => {}
+            KeyCode::Char('z') => {
+                self.maximized = if self.maximized.is_some() {
+                    None
+                } else {
+                    Some(self.focus)
+                };
+            }
+            KeyCode::Tab if self.maximized.is_none() => {
+                self.focus = if document_focused {
+                    PreviewPane::Terminal
+                } else {
+                    PreviewPane::Document
+                };
+            }
+            _ if !document_focused => return (false, false),
+            KeyCode::Esc => return (true, true),
+            _ => {
+                let page = usize::from(rows.saturating_sub(3)).max(1);
+                let max_offset = self
+                    .content
+                    .as_ref()
+                    .and_then(|content| content.as_ref().ok())
+                    .map_or(0, |body| body.lines().count().saturating_sub(page));
+                self.offset = match key.code {
+                    KeyCode::Up => self.offset.saturating_sub(1),
+                    KeyCode::Down => self.offset.saturating_add(1).min(max_offset),
+                    KeyCode::PageUp => self.offset.saturating_sub(page),
+                    KeyCode::PageDown => self.offset.saturating_add(page).min(max_offset),
+                    _ => self.offset,
+                };
+            }
         }
-        false
+        (true, false)
+    }
+}
+
+fn join_preview_columns<'a>(
+    mut left: impl Iterator<Item = &'a str>,
+    left_cols: u16,
+    right: Vec<String>,
+    rows: u16,
+) -> Vec<String> {
+    let left_cols = usize::from(left_cols);
+    (0..usize::from(rows))
+        .map(|row| {
+            let left = truncate(left.next().unwrap_or(""), left_cols);
+            let right = right.get(row).map_or("", String::as_str);
+            format!("{}│{right}", pad_to(&left, left_cols))
+        })
+        .collect()
+}
+
+fn drive_event(
+    ui: &mut ClusterUi,
+    event: &crossterm::event::Event,
+    terminal_preview_focused: bool,
+) -> Option<drive::Action> {
+    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+    if !DocumentPreview::terminal_navigation(ui) {
+        return None;
+    }
+    let Event::Key(key) = event else { return None };
+    if key.kind != KeyEventKind::Press || key.modifiers != KeyModifiers::NONE {
+        return None;
+    }
+    let binding = ui.keymap.resolve("cluster.tree", *key);
+    if ui.keymap.resolve("cluster.runtime", *key).is_some() {
+        return None;
+    }
+    let sidebar = ui.drive.as_mut()?;
+    if key.code == KeyCode::Char('d') && binding.is_none() {
+        sidebar.toggle();
+        return Some(drive::Action::Handled);
+    }
+    if !sidebar.visible || matches!(binding, Some("cluster.help" | "cluster.detach")) {
+        return None;
+    }
+    if terminal_preview_focused && matches!(binding, Some("cluster.select" | "cluster.remote.keys"))
+    {
+        return None;
+    }
+    if key.code == KeyCode::Esc {
+        sidebar.visible = false;
+        return Some(drive::Action::Handled);
+    }
+    Some(sidebar.key(key.code))
+}
+
+enum WorkspaceEvent {
+    Ignored,
+    Handled,
+    PreviewChanged,
+}
+
+fn workspace_event(
+    ui: &mut ClusterUi,
+    file_preview: &mut Option<DocumentPreview>,
+    event: &crossterm::event::Event,
+    rows: u16,
+    file_loading: &Arc<AtomicBool>,
+) -> WorkspaceEvent {
+    if let Some(preview) = file_preview {
+        let (handled, close) = preview.event(event, ui, rows);
+        if close {
+            *file_preview = None;
+            return WorkspaceEvent::PreviewChanged;
+        }
+        if handled {
+            return WorkspaceEvent::Handled;
+        }
+    }
+    let terminal_focused = file_preview
+        .as_ref()
+        .is_some_and(|preview| preview.focus == PreviewPane::Terminal);
+    match drive_event(ui, event, terminal_focused) {
+        None => WorkspaceEvent::Ignored,
+        Some(drive::Action::Handled) => WorkspaceEvent::Handled,
+        Some(drive::Action::Open { uri, size }) => {
+            let Some(preview) = DocumentPreview::load_drive(uri, size, file_loading.clone()) else {
+                return WorkspaceEvent::Handled;
+            };
+            *file_preview = Some(preview);
+            WorkspaceEvent::PreviewChanged
+        }
     }
 }
 
@@ -4601,9 +4939,10 @@ fn run_loop(
     select_target_with_remote_wait(&mut ui, target, remote_source, Duration::from_secs(5))?;
     focus_initial_remote_composer(&mut ui, clock.now());
     ui.file_link_hits = true;
+    ui.drive = Some(drive::Sidebar::default());
     let mut previous = None;
     let mut file_mouse = FileMouseCapture::default();
-    let mut file_preview: Option<LinkedFilePreview> = None;
+    let mut file_preview: Option<DocumentPreview> = None;
     let mut link_press = None;
     let mut last_full_repaint = clock.now();
     let mut frames = frame_writer()?;
@@ -4626,21 +4965,43 @@ fn run_loop(
             remote_selection.clear();
         }
         ui.clamp_session_cursor();
+        if let Some(sidebar) = &mut ui.drive {
+            sidebar.poll();
+        }
         let terminal_size = crossterm::terminal::size().unwrap_or((80, 24));
         let (cols, rows) = normalized_terminal_size(terminal_size.0, terminal_size.1);
-        resize_active_pane(
-            &mut ui,
-            path,
-            remote_calls.as_mut(),
-            cols,
-            rows,
-            clock.now(),
-        );
-        let captured = capture_local_pane(&mut ui, path, clock);
+        if file_preview
+            .as_ref()
+            .and_then(|preview| preview.origin.as_ref())
+            .is_some_and(|origin| ui.remote_active.as_ref() != Some(origin))
+        {
+            file_preview = None;
+            previous = None;
+        }
+        let layout = file_preview
+            .as_ref()
+            .map(|preview| preview.layout(&ui, cols, clock.now()));
+        let resize = match layout {
+            Some(layout) => layout
+                .terminal_cols(cols)
+                .map(|cols| (cols, rows.saturating_sub(1).max(1))),
+            None => Some((cols, rows)),
+        };
+        if let Some((cols, rows)) = resize {
+            resize_active_pane(
+                &mut ui,
+                path,
+                remote_calls.as_mut(),
+                cols,
+                rows,
+                clock.now(),
+            );
+        }
+        let captured = resize.and_then(|_| capture_local_pane(&mut ui, path, clock));
         let body = captured.unwrap_or_default();
-        let frame = match &mut file_preview {
-            Some(preview) => preview.frame(cols, rows),
-            None => ui.render(cols, rows, &body, clock),
+        let frame = match (layout, &mut file_preview) {
+            (Some(layout), Some(preview)) => preview.frame(layout, &ui, cols, rows, &body, clock),
+            _ => ui.render(cols, rows, &body, clock),
         };
         let mut next = vt100::Parser::new(rows, cols, 0);
         next.process(format!("\x1b[H\x1b[2J{}", terminal_frame(&frame)).as_bytes());
@@ -4676,12 +5037,13 @@ fn run_loop(
             ui.input_wait(Instant::now()),
         )? {
             let event = crossterm::event::read()?;
-            if let Some(preview) = &mut file_preview {
-                if preview.event(event, rows) {
-                    file_preview = None;
+            match workspace_event(&mut ui, &mut file_preview, &event, rows, &file_loading) {
+                WorkspaceEvent::Ignored => {}
+                WorkspaceEvent::Handled => continue,
+                WorkspaceEvent::PreviewChanged => {
                     previous = None;
+                    continue;
                 }
-                continue;
             }
             if let crossterm::event::Event::Mouse(mouse) = event {
                 use crossterm::event::{MouseButton, MouseEventKind};
@@ -4701,21 +5063,12 @@ fn run_loop(
                         if let (
                             Some((pressed, uri, origin)),
                             Some(target),
-                            Some(
-                                current @ RemoteSelection::Session {
-                                    node,
-                                    wire_name,
-                                    instance_id,
-                                    ..
-                                },
-                            ),
+                            Some(current @ RemoteSelection::Session { .. }),
                         ) = (link_press.take(), link, &ui.remote_active)
                         {
                             if pressed == point && uri == target && &origin == current {
-                                file_preview = LinkedFilePreview::load(
-                                    node.clone(),
-                                    wire_name.clone(),
-                                    instance_id.clone(),
+                                file_preview = DocumentPreview::load_link(
+                                    current.clone(),
                                     uri,
                                     file_loading.clone(),
                                 );

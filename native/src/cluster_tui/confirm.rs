@@ -16,6 +16,10 @@ impl Confirmation {
         self.target = Some((name, instance_id));
     }
 
+    pub(super) fn pending(&self) -> bool {
+        self.target.is_some()
+    }
+
     pub fn prompt(&self, width: usize, help: &str) -> Option<String> {
         self.target.as_ref().map(|(name, _)| {
             let prefix = "kill ";
