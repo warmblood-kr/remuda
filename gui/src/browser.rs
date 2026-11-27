@@ -2,6 +2,7 @@ use gpui::{
     div, prelude::*, px, rgb, AnyElement, App, Bounds, Context, FocusHandle, KeyDownEvent, Window,
     WindowBounds, WindowOptions,
 };
+use gpui_kit::assets::IconName;
 use gpui_kit::base::{Button, ScrollbarMode, Tab, Tabs};
 use remuda_core::agent::{AgentProcess, Size};
 use remuda_native::net::browser::{
@@ -322,7 +323,7 @@ impl Assets {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Content {
+pub(crate) enum Content {
     Terminal,
     Document,
 }
@@ -354,6 +355,7 @@ struct DocumentTab {
     painted: Rc<Cell<bool>>,
     scroll: gpui::ScrollHandle,
     zoom: f32,
+    pan_start: Option<(gpui::Point<gpui::Pixels>, gpui::Point<gpui::Pixels>)>,
     #[cfg(any(target_os = "macos", windows))]
     native_html: NativeHtml,
 }
@@ -398,6 +400,7 @@ pub(crate) struct Browser {
     document_focus: FocusHandle,
     drive_focus: FocusHandle,
     split: bool,
+    maximized: Option<Content>,
 }
 
 pub fn open(
@@ -533,6 +536,7 @@ impl Browser {
             document_focus: cx.focus_handle(),
             drive_focus: cx.focus_handle(),
             split: false,
+            maximized: None,
         }
     }
 
@@ -581,7 +585,7 @@ impl Browser {
     }
 
     pub(crate) fn showing_document(&self) -> bool {
-        self.active == Content::Document
+        self.maximized.unwrap_or(self.active) == Content::Document
     }
     pub(crate) fn has_document(&self) -> bool {
         !self.document_tabs.is_empty()
@@ -606,11 +610,23 @@ impl Browser {
     }
     pub(crate) fn select_terminal(&mut self, cx: &App) {
         self.active = Content::Terminal;
+        self.maximized = None;
         self.split = false;
         self.hide_native_document(cx);
     }
+    pub(crate) fn focus_terminal_for_input(&mut self, window: &Window, cx: &App) {
+        self.active = Content::Terminal;
+        if self.maximized.is_some() {
+            self.maximized = Some(Content::Terminal);
+        }
+        if !Self::wide(window) || !self.split_requested() {
+            self.hide_native_document(cx);
+        }
+    }
+
     pub(crate) fn select_document(&mut self, window: &mut Window, cx: &mut App) {
         self.active = Content::Document;
+        self.maximized = None;
         self.split = false;
         self.document_focus.focus(window, cx);
     }
@@ -624,10 +640,35 @@ impl Browser {
         }
     }
     pub(crate) fn split_requested(&self) -> bool {
-        self.split
+        self.split && self.maximized.is_none()
     }
     pub(crate) fn select_split(&mut self) {
+        self.maximized = None;
         self.split = true;
+    }
+    pub(crate) fn has_split_layout(&self) -> bool {
+        self.split
+    }
+    pub(crate) fn maximized(&self) -> Option<Content> {
+        self.maximized
+    }
+    pub(crate) fn toggle_pane(&mut self, pane: Content, window: &mut Window, cx: &mut App) {
+        if !self.split || !self.has_document() {
+            return;
+        }
+        self.maximized = if self.maximized == Some(pane) {
+            None
+        } else {
+            Some(pane)
+        };
+        self.active = pane;
+        match pane {
+            Content::Terminal => {
+                self.hide_native_document(cx);
+                self.focus.focus(window, cx);
+            }
+            Content::Document => self.document_focus.focus(window, cx),
+        }
     }
 
     pub(crate) fn wide(window: &Window) -> bool {
@@ -657,10 +698,12 @@ impl Browser {
             let _ = index;
         }
         if let Ok(document) = self.documents.try_recv() {
-            let typing = (self.embedded || self.focus.is_focused(window))
-                && self
-                    .last_input
-                    .is_some_and(|last| last.elapsed() < Duration::from_secs(2));
+            let terminal_maximized = self.maximized == Some(Content::Terminal);
+            let typing = terminal_maximized
+                || ((self.embedded || self.focus.is_focused(window))
+                    && self
+                        .last_input
+                        .is_some_and(|last| last.elapsed() < Duration::from_secs(2)));
             if !typing && !window.is_window_active() {
                 cx.activate(true);
                 window.activate_window();
@@ -668,7 +711,11 @@ impl Browser {
             if typing && Self::wide(window) && !self.showing_document() {
                 self.split = true;
             }
+            let selected_tab = self.document_index;
             self.open_document(document, !typing, window, cx);
+            if terminal_maximized {
+                self.document_index = selected_tab;
+            }
             cx.notify();
             window.refresh();
         }
@@ -715,6 +762,9 @@ impl Browser {
                         drive.last_action = None;
                         let drive_had_focus = self.drive_focus.is_focused(window);
                         self.open_document(document, true, window, cx);
+                        if self.maximized == Some(Content::Terminal) {
+                            self.toggle_pane(Content::Document, window, cx);
+                        }
                         if drive_had_focus {
                             self.drive_focus.focus(window, cx);
                         }
@@ -724,6 +774,7 @@ impl Browser {
                     Err(error) if matches!(drive.last_action, Some(DriveAction::OpenFile(..))) => {
                         self.link_error = Some(error);
                         self.active = Content::Document;
+                        self.maximized = None;
                         self.split = false;
                         drive.last_action = None;
                     }
@@ -804,6 +855,7 @@ impl Browser {
                 painted: Default::default(),
                 scroll: Default::default(),
                 zoom: 1.,
+                pan_start: None,
                 #[cfg(any(target_os = "macos", windows))]
                 native_html,
             };
@@ -824,13 +876,28 @@ impl Browser {
     }
 
     fn close_document(&mut self, window: &mut Window, cx: &mut App) {
-        if !self.has_document() {
+        self.close_document_at(self.document_index, window, cx);
+    }
+
+    fn close_document_at(&mut self, index: usize, window: &mut Window, cx: &mut App) {
+        if index >= self.document_tabs.len() {
+            return;
+        }
+        if index != self.document_index {
+            let closed = self.document_tabs.remove(index);
+            closed.document.media.release_images(window);
+            if index < self.document_index {
+                self.document_index -= 1;
+            }
+            self.document_focus.focus(window, cx);
             return;
         }
         self.hide_native_document(cx);
         let closed = self.document_tabs.remove(self.document_index);
         closed.document.media.release_images(window);
         if self.document_tabs.is_empty() {
+            self.maximized = None;
+            self.split = false;
             self.document_index = 0;
             self.active = Content::Terminal;
             self.focus.focus(window, cx);
@@ -1101,31 +1168,59 @@ impl Browser {
             .children(rows.iter().map(|(_, depth, entry)| {
                 let uri = entry.uri.clone();
                 let directory = entry.is_directory;
-                let label = if directory {
-                    format!(
-                        "{} {}",
-                        if drive.expanded.contains(&uri) {
-                            "▾"
-                        } else {
-                            "▸"
-                        },
-                        entry.name
-                    )
+                let folder_state = if drive.expanded.contains(&uri) {
+                    IconName::ChevronDown
                 } else {
-                    entry.name.clone()
+                    IconName::ChevronRight
                 };
-                button(
-                    gpui::SharedString::from(format!("drive:{uri}")),
-                    label,
-                    drive.selected.as_ref() == Some(&uri),
-                )
-                .ml(px((*depth).min(12) as f32 * 14.))
-                .truncate()
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.drive_focus.focus(window, cx);
-                    this.visit(uri.clone(), directory);
-                    cx.notify();
-                }))
+                let selected = drive.selected.as_ref() == Some(&uri);
+                let full_name = uri.clone();
+                div()
+                    .id(gpui::SharedString::from(format!("drive:{uri}")))
+                    .ml(px((*depth).min(12) as f32 * 12.))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_1()
+                    .py_1()
+                    .rounded_sm()
+                    .text_xs()
+                    .cursor_pointer()
+                    .hover(|row| row.bg(rgb(0x34445a)))
+                    .when(selected, |row| {
+                        row.bg(rgb(0x233e57)).text_color(rgb(0xf4f6fc))
+                    })
+                    .child(
+                        div()
+                            .w(px(13.))
+                            .flex_none()
+                            .when(directory, |d| d.child(folder_state)),
+                    )
+                    .child(drive_icon(entry))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(entry.name.clone()),
+                    )
+                    .when_some(entry.size.filter(|_| !directory), |d, size| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .text_color(rgb(0xb5beca))
+                                .child(drive_file_size(size)),
+                        )
+                    })
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| crate::session_tree::FullName(full_name.clone()))
+                            .into()
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.drive_focus.focus(window, cx);
+                        this.visit(uri.clone(), directory);
+                        cx.notify();
+                    }))
             }))
             .children(pages.into_iter().map(|(directory, after, name)| {
                 let id = gpui::SharedString::from(format!("drive-more:{after}:{directory:?}"));
@@ -1176,7 +1271,7 @@ impl Browser {
                     ),
                 )
             });
-        let refresh = action_button("drive-refresh", "Refresh")
+        let refresh = icon_button("drive-refresh", IconName::RefreshCw, "Refresh Drive")
             .disabled(drive.pending)
             .on_click(cx.listener(|this, _, _, cx| {
                 if let Some(drive) = &mut this.drive {
@@ -1229,6 +1324,7 @@ impl Browser {
                         if let Some(error) = error {
                             this.link_error = Some(error);
                             this.active = Content::Document;
+                            this.maximized = None;
                             this.split = false;
                         }
                         cx.notify();
@@ -1406,14 +1502,17 @@ impl Browser {
             .children(self.document_tabs.iter().enumerate().map(|(index, tab)| {
                 let generation = tab.generation;
                 let title = tab.document.media.title.clone();
+                let full_name = format!("{}\n{}", title, tab.document.uri);
+                let close_label = format!("Close {title}");
                 let label = if tab.unseen() {
                     format!("{title} •")
                 } else {
                     title
                 };
-                Tab::new(("document-tab", generation as usize))
+                let tab = Tab::new(("document-tab", generation as usize))
                     .debug_selector(move || format!("document-tab-{generation}"))
                     .selected(index == self.document_index)
+                    .accessibility_label(full_name.clone())
                     .set_position(index + 1, count)
                     .styles(|style| {
                         style.selected(|style| style.bg(rgb(0x365370)).text_color(rgb(0xf4f6fc)))
@@ -1426,6 +1525,10 @@ impl Browser {
                     .cursor_pointer()
                     .hover(|d| d.bg(rgb(0x52647a)).text_color(rgb(0xf4f6fc)))
                     .child(div().truncate().child(label))
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| crate::session_tree::FullName(full_name.clone()))
+                            .into()
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(index) = this
                             .document_tabs
@@ -1435,7 +1538,30 @@ impl Browser {
                             this.switch_document_tab(index, cx);
                             cx.notify();
                         }
-                    }))
+                    }));
+                let close = if index == self.document_index {
+                    icon_button("close-document", IconName::Close, "Close document")
+                } else {
+                    styled_action_button(Button::new(("close-document-tab", generation as usize)))
+                        .flex_none()
+                        .accessibility_label(close_label)
+                        .child(IconName::Close)
+                };
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_none()
+                    .child(tab)
+                    .child(close.on_click(cx.listener(move |this, _, window, cx| {
+                        if let Some(index) = this
+                            .document_tabs
+                            .iter()
+                            .position(|tab| tab.generation == generation)
+                        {
+                            this.close_document_at(index, window, cx);
+                            cx.notify();
+                        }
+                    })))
             }))
             .into_any_element()
     }
@@ -1444,6 +1570,7 @@ impl Browser {
         &mut self,
         pane_width: f32,
         dragging: bool,
+        layout_controls: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         // The OS-owned HTML surface receives pointer events. Hide it while
@@ -1530,48 +1657,67 @@ impl Browser {
                     .overflow_scroll()
                     .track_scroll(&tab.scroll)
                     .debug_selector(|| "browser-document-scroll".into())
+                    .when(document.media.is_image() && tab.zoom > 1., |panel| {
+                        panel
+                            .cursor(if tab.pan_start.is_some() {
+                                gpui::CursorStyle::ClosedHand
+                            } else {
+                                gpui::CursorStyle::OpenHand
+                            })
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                                    if let Some(tab) = this.document_tab_mut() {
+                                        tab.pan_start = Some((event.position, tab.scroll.offset()));
+                                        cx.notify();
+                                    }
+                                }),
+                            )
+                            .on_mouse_move(cx.listener(
+                                |this, event: &gpui::MouseMoveEvent, _, cx| {
+                                    let Some(tab) = this.document_tab_mut() else {
+                                        return;
+                                    };
+                                    let Some((start, scroll)) = tab.pan_start else {
+                                        return;
+                                    };
+                                    if event.pressed_button == Some(gpui::MouseButton::Left) {
+                                        let offset = scroll + (event.position - start);
+                                        let max = tab.scroll.max_offset();
+                                        tab.scroll.set_offset(gpui::point(
+                                            offset.x.clamp(-max.x, px(0.)),
+                                            offset.y.clamp(-max.y, px(0.)),
+                                        ));
+                                    } else {
+                                        tab.pan_start = None;
+                                    }
+                                    cx.notify();
+                                },
+                            ))
+                            .on_mouse_up(
+                                gpui::MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    if let Some(tab) = this.document_tab_mut() {
+                                        tab.pan_start = None;
+                                        cx.notify();
+                                    }
+                                }),
+                            )
+                    })
                     .p_6()
                     .child(body),
             )
             .into_any_element()
         };
         #[cfg(any(target_os = "macos", windows))]
-        let (body, preview_button) = if self.native_source.is_some() && document.html.is_some() {
-            let label = if tab.native_html.selected {
-                "Reader"
+        let body = if tab.native_html.selected {
+            if dragging {
+                div().flex_1().into_any_element()
             } else {
-                "Native preview"
-            };
-            let button = action_button("native-preview", label).on_click(cx.listener(
-                |this, _, window, cx| {
-                    let Some(tab) = this.document_tab_mut() else {
-                        return;
-                    };
-                    tab.native_html.selected = !tab.native_html.selected;
-                    tab.native_html.failed = false;
-                    if !tab.native_html.selected {
-                        tab.native_html.hide(cx);
-                    }
-                    if tab.unseen() {
-                        // Invalidate a callback scheduled by the previous renderer.
-                        tab.painted = Default::default();
-                    }
-                    this.document_focus.focus(window, cx);
-                    cx.notify();
-                },
-            ));
-            let body = if tab.native_html.selected {
-                if dragging {
-                    div().flex_1().into_any_element()
-                } else {
-                    Self::native_panel(tab, cx)
-                }
-            } else {
-                fallback()
-            };
-            (body, Some(button))
+                Self::native_panel(tab, cx)
+            }
         } else {
-            (fallback(), None)
+            fallback()
         };
         #[cfg(not(any(target_os = "macos", windows)))]
         let body = fallback();
@@ -1607,9 +1753,8 @@ impl Browser {
                     )
                     .when(document.media.is_image(), |d| {
                         d.child(
-                            action_button("zoom-in", "+")
-                                .accessibility_label("Zoom in")
-                                .on_click(cx.listener(|this, event, window, cx| {
+                            icon_button("zoom-in", IconName::ZoomIn, "Zoom in").on_click(
+                                cx.listener(|this, event, window, cx| {
                                     if let Some(tab) = this.document_tab_mut() {
                                         tab.zoom = (tab.zoom * 1.25).min(8.);
                                     }
@@ -1617,41 +1762,47 @@ impl Browser {
                                         this.document_focus.focus(window, cx);
                                     }
                                     cx.notify();
+                                }),
+                            ),
+                        )
+                        .child(
+                            icon_button("zoom-fit", IconName::Scan, "Fit image").on_click(
+                                cx.listener(|this, event, window, cx| {
+                                    if let Some(tab) = this.document_tab_mut() {
+                                        tab.zoom = 1.;
+                                        tab.pan_start = None;
+                                    }
+                                    if !matches!(event, gpui::ClickEvent::Keyboard(_)) {
+                                        this.document_focus.focus(window, cx);
+                                    }
+                                    cx.notify();
+                                }),
+                            ),
+                        )
+                    })
+                    .when(layout_controls, |toolbar| {
+                        toolbar.child(
+                            pane_layout_button(
+                                "document-layout",
+                                self.maximized == Some(Content::Document),
+                            )
+                            .on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.toggle_pane(Content::Document, window, cx);
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                    })
+                    .when(self.document_tabs.len() == 1, |toolbar| {
+                        toolbar.child(
+                            icon_button("close-document", IconName::Close, "Close document")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.close_document(window, cx);
+                                    cx.notify();
                                 })),
                         )
-                        .child(action_button("zoom-fit", "Fit").on_click(cx.listener(
-                            |this, event, window, cx| {
-                                if let Some(tab) = this.document_tab_mut() {
-                                    tab.zoom = 1.;
-                                }
-                                if !matches!(event, gpui::ClickEvent::Keyboard(_)) {
-                                    this.document_focus.focus(window, cx);
-                                }
-                                cx.notify();
-                            },
-                        )))
-                    })
-                    .when_some(
-                        {
-                            #[cfg(any(target_os = "macos", windows))]
-                            {
-                                preview_button
-                            }
-                            #[cfg(not(any(target_os = "macos", windows)))]
-                            {
-                                None::<Button>
-                            }
-                        },
-                        |toolbar, button| toolbar.child(button),
-                    )
-                    .child(
-                        action_button("close-document", "Close").on_click(cx.listener(
-                            |this, _, window, cx| {
-                                this.close_document(window, cx);
-                                cx.notify();
-                            },
-                        )),
-                    ),
+                    }),
             )
             .when(
                 {
@@ -1943,9 +2094,31 @@ fn tab(id: &'static str, label: &'static str, selected: bool) -> Tab {
         .child(label)
 }
 
+pub(crate) fn pane_layout_button(id: &'static str, maximized: bool) -> Button {
+    if maximized {
+        icon_button(id, IconName::Minimize, "Restore split")
+    } else {
+        icon_button(id, IconName::Maximize, "Maximize pane")
+    }
+}
+
+fn icon_button(id: &'static str, icon: IconName, label: &'static str) -> Button {
+    styled_action_button(Button::new(id).debug_selector(move || id.into()))
+        .flex_none()
+        .accessibility_label(label)
+        .tooltip(move |_, cx| {
+            cx.new(|_| crate::session_tree::FullName(label.into()))
+                .into()
+        })
+        .child(icon)
+}
+
 fn action_button(id: &'static str, label: &'static str) -> Button {
-    Button::new(id)
-        .debug_selector(move || id.into())
+    styled_action_button(Button::new(id).debug_selector(move || id.into())).child(label)
+}
+
+fn styled_action_button(button: Button) -> Button {
+    button
         .px_2()
         .py_1()
         .rounded_sm()
@@ -1954,7 +2127,35 @@ fn action_button(id: &'static str, label: &'static str) -> Button {
         .styles(|style| style.disabled(|style| style.opacity(0.55)))
         .hover(|d| d.bg(rgb(0x52647a)).text_color(rgb(0xf4f6fc)))
         .focus_visible(|d| d.bg(rgb(0x52647a)).text_color(rgb(0xf4f6fc)))
-        .child(label)
+}
+
+fn drive_icon(entry: &remuda_native::net::browser::DriveEntry) -> IconName {
+    if entry.is_directory {
+        return IconName::Folder;
+    }
+    match entry
+        .name
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("md" | "txt" | "rst") => IconName::FileText,
+        Some("html" | "htm" | "css" | "js" | "json") => IconName::FileCode,
+        Some("png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tiff" | "svg") => {
+            IconName::FileImage
+        }
+        _ => IconName::File,
+    }
+}
+
+fn drive_file_size(size: u64) -> String {
+    if size >= 1024 * 1024 {
+        format!("{:.1} MiB", size as f64 / (1024. * 1024.))
+    } else if size >= 1024 {
+        format!("{:.1} KiB", size as f64 / 1024.)
+    } else {
+        format!("{size} B")
+    }
 }
 
 fn button(
@@ -2038,7 +2239,8 @@ impl Render for Browser {
             );
         if wide {
             let terminal = self.terminal_panel(cx);
-            let document = self.document_panel(document_width, self.document_split.dragging(), cx);
+            let document =
+                self.document_panel(document_width, self.document_split.dragging(), false, cx);
             content = content.child(
                 div()
                     .flex()
@@ -2068,6 +2270,7 @@ impl Render for Browser {
             content = content.child(self.document_panel(
                 document_width,
                 self.document_split.dragging(),
+                false,
                 cx,
             ));
         } else {
@@ -2131,6 +2334,7 @@ mod tests {
             name: uri.rsplit('/').next().unwrap().into(),
             uri: uri.into(),
             is_directory,
+            size: None,
         };
         let plan = vec![
             RefreshDirectory {
@@ -2289,6 +2493,7 @@ mod tests {
                 document_focus: cx.focus_handle(),
                 drive_focus: cx.focus_handle(),
                 split: false,
+                maximized: None,
             }
         });
         cx.simulate_resize(gpui::size(px(800.), px(600.)));
@@ -2446,6 +2651,7 @@ mod tests {
                         name: "sub".into(),
                         uri: folder.clone(),
                         is_directory: true,
+                        size: None,
                     }],
                     complete: true,
                     next: None,
@@ -2490,6 +2696,7 @@ mod tests {
                             name: "plan.md".into(),
                             uri: format!("{folder}/plan.md"),
                             is_directory: false,
+                            size: Some(12),
                         }],
                         complete: true,
                         next: None,
@@ -2535,6 +2742,28 @@ mod tests {
         assert_eq!(
             view.read_with(cx, |browser, _| browser.document_tab().unwrap().zoom),
             1.25
+        );
+        let image_panel = cx.debug_bounds("browser-document-scroll").unwrap();
+        let from = image_panel.center();
+        let to = gpui::point(from.x - px(48.), from.y - px(48.));
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Left,
+            position: from,
+            ..Default::default()
+        });
+        cx.simulate_event(gpui::MouseMoveEvent {
+            pressed_button: Some(gpui::MouseButton::Left),
+            position: to,
+            ..Default::default()
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            button: gpui::MouseButton::Left,
+            position: to,
+            ..Default::default()
+        });
+        assert!(
+            view.read_with(cx, |b, _| b.document_tab().unwrap().scroll.offset().x
+                < px(0.))
         );
         let first = cx.debug_bounds("document-tab-1").unwrap();
         let third = cx.debug_bounds("document-tab-3").unwrap();

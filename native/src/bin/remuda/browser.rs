@@ -3,12 +3,12 @@ use std::io::{self, IsTerminal};
 use std::process::{Command, ExitCode};
 
 const USAGE: &str =
-    "Usage: remuda browser [USER@]HOST\n       remuda browser --gui [USER@]HOST\n       remuda browser open-document [--session] REQUEST_ID URI\n       remuda browser link URI [LABEL]";
+    "Usage: remuda browser [[USER@]HOST]\n       remuda browser --gui [[USER@]HOST]\n       remuda browser open-document [--session] REQUEST_ID URI\n       remuda browser link URI [LABEL]";
 
 pub(super) fn run(args: &[&str], server: &str, stdin_enabled: bool) -> ExitCode {
     if matches!(args, ["-h" | "--help" | "help"]) {
         println!(
-            "{USAGE}\n\nConnect to Remuda through SSH. Use --gui for the native client on macOS or Windows.\nAn SSH config alias is accepted. The remote login account must have remuda on its PATH."
+            "{USAGE}\n\nWithout a host, open the local workspace or choose a remote host on macOS or Windows. With a host, connect through SSH. Use --gui for the native client.\nAn SSH config alias is accepted. The remote login account must have remuda on its PATH."
         );
         return ExitCode::SUCCESS;
     }
@@ -36,11 +36,14 @@ pub(super) fn run(args: &[&str], server: &str, stdin_enabled: bool) -> ExitCode 
     if let ["open-document", "--session", request_id, uri] = args {
         return publish_document(request_id, uri, true);
     }
+    if matches!(args, [] | ["--gui"]) {
+        return launch_gui(&["--browser-auto"]);
+    }
     if let ["--gui", destination] = args {
         if !valid_destination(destination) {
             return super::fail(USAGE);
         }
-        return launch_gui(destination);
+        return launch_gui(&["--browser", destination]);
     }
     let [destination] = args else {
         return super::fail(USAGE);
@@ -69,7 +72,7 @@ pub(super) fn run(args: &[&str], server: &str, stdin_enabled: bool) -> ExitCode 
 }
 
 #[cfg(any(target_os = "macos", windows))]
-fn launch_gui(destination: &str) -> ExitCode {
+fn launch_gui(args: &[&str]) -> ExitCode {
     let cli = match std::env::current_exe() {
         Ok(path) => path,
         Err(error) => return super::fail(format!("cannot locate Remuda Browser: {error}")),
@@ -79,10 +82,7 @@ fn launch_gui(destination: &str) -> ExitCode {
         Ok(None) => return super::fail("Remuda Browser GUI is missing from this installation. Install a nightly that includes the GUI."),
         Err(error) => return super::fail(format!("cannot locate Remuda Browser: {error}")),
     };
-    match Command::new(&executable)
-        .args(["--browser", destination])
-        .spawn()
-    {
+    match Command::new(&executable).args(args).spawn() {
         Ok(_) => ExitCode::SUCCESS,
         Err(error) => super::fail(format!(
             "cannot launch Remuda Browser at {}: {error}",
@@ -92,7 +92,7 @@ fn launch_gui(destination: &str) -> ExitCode {
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
-fn launch_gui(_: &str) -> ExitCode {
+fn launch_gui(_: &[&str]) -> ExitCode {
     super::fail("The native Remuda Browser is supported on macOS and Windows")
 }
 

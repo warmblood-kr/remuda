@@ -26,6 +26,8 @@ pub struct DriveEntry {
     pub name: String,
     pub uri: String,
     pub is_directory: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -292,12 +294,13 @@ impl DriveGrant {
                             uri: VfsUri::format("", &format!("{prefix}{name}")),
                             name,
                             is_directory: true,
+                            size: None,
                         })
                         .chain(
                             children
                                 .files
                                 .into_iter()
-                                .map(|entry| file_row(&entry.path)),
+                                .map(|entry| file_row(&entry.path, entry.size)),
                         ),
                 )
             }
@@ -305,7 +308,7 @@ impl DriveGrant {
                 self.document
                     .as_deref()
                     .and_then(|path| index.live(path))
-                    .map(|entry| file_row(&entry.path))
+                    .map(|entry| file_row(&entry.path, entry.size))
                     .into_iter(),
             ),
         };
@@ -374,11 +377,12 @@ fn descendant(dir: &str, path: &str) -> bool {
         .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
-fn file_row(path: &str) -> DriveEntry {
+fn file_row(path: &str, size: u64) -> DriveEntry {
     DriveEntry {
         name: path.rsplit('/').next().unwrap_or(path).to_owned(),
         uri: VfsUri::format("", path),
         is_directory: false,
+        size: Some(size),
     }
 }
 
@@ -645,6 +649,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             [("design", true), ("readme.md", false)]
         );
+        assert_eq!(root.entries[0].size, None);
+        assert_eq!(root.entries[1].size, Some(index.entries["readme.md"].size));
+        let legacy: DriveEntry = serde_json::from_str(
+            r#"{"name":"old.md","uri":"remuda:///old.md","is_directory":false}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.size, None);
         assert!(!local.authorizes_document("remuda:///readme.md"));
     }
 

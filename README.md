@@ -51,12 +51,30 @@ byte, so it carries no inter-key timing for a stack of nested ttys to mangle.
 agent's own TUI — can swallow `Ctrl-\` before remuda sees it. `remuda attach`
 has always had that ceiling and this shares it.
 
+On macOS and Windows, **Open Browser…** in the tray and
+`remuda browser --gui` open the same local workspace as `remuda gui` when
+the local daemon responds. Otherwise they prompt for a remote host and
+connect without starting a local daemon. `remuda browser --gui HOST`
+selects a remote host directly.
+
 Use `remuda browser user@host` from a terminal to open Remuda on a remote
 machine. The client uses your SSH configuration and host verification. The
 remote login account needs `remuda` on its PATH. An SSH config alias also
 works, including aliases for hosts that use a custom SSH port. The client
 machine needs the Remuda CLI and an SSH client. It can launch Browser without
 a local daemon or cluster membership.
+
+### View a terminal and a document together
+
+In the desktop workspace, open a document and choose **Split view**. Each pane
+header can maximize that pane and restore the split. The terminal draft and
+open document tabs stay available when their pane is hidden.
+
+In the cluster TUI, press `d` while navigating to switch between Sessions
+and Drive. Use the arrows and Enter to browse or open a text document. In
+the workspace, Tab moves focus between the terminal and document, and `z`
+maximizes or restores the focused pane. Exit terminal input mode first to
+use workspace shortcuts from the terminal.
 
 ### Open a VFS document for a Browser reader
 

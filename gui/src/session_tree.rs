@@ -781,6 +781,10 @@ impl Render for LocalGui {
             .attention_focus
             .get_or_insert_with(|| cx.focus_handle())
             .clone();
+        let terminal_layout_focus = self
+            .terminal_layout_focus
+            .get_or_insert_with(|| cx.focus_handle())
+            .clone();
         let keys_focus = self
             .keys_focus
             .get_or_insert_with(|| cx.focus_handle())
@@ -819,12 +823,7 @@ impl Render for LocalGui {
         let current = current && !self.selected_peer_offline();
         let snapshot = if let Some(at) = self.preview_received {
             if live {
-                let mode = if self.line_input.is_some() {
-                    "Line input"
-                } else {
-                    "Direct input"
-                };
-                format!("{mode} · screen {} ago", compact_age(at.elapsed()))
+                format!("Screen · {} ago", compact_age(at.elapsed()))
             } else if self.preview_failed || !current {
                 format!("Last known screen · {} ago", compact_age(at.elapsed()))
             } else {
@@ -908,6 +907,13 @@ impl Render for LocalGui {
         } else {
             None
         };
+        let layout_controls = self.selection.is_some()
+            && docs.as_ref().is_some_and(|docs| {
+                let docs = docs.read(cx);
+                docs.has_document()
+                    && docs.has_split_layout()
+                    && (workspace_wide || docs.maximized().is_some())
+            });
         let pane_width = if narrow { width } else { width - sidebar - 5. };
         let (terminal_width, document_width) = if split {
             self.document_split.widths(pane_width)
@@ -922,7 +928,12 @@ impl Render for LocalGui {
         let document = if split || document_selected {
             docs.as_ref().map(|docs| {
                 docs.update(cx, |docs, cx| {
-                    docs.document_panel(document_width, self.document_split.dragging(), cx)
+                    docs.document_panel(
+                        document_width,
+                        self.document_split.dragging(),
+                        layout_controls,
+                        cx,
+                    )
                 })
             })
         } else {
@@ -939,62 +950,75 @@ impl Render for LocalGui {
             .content_tabs_focus
             .get_or_insert_with(|| cx.focus_handle())
             .clone();
-        let content_tabs = docs.as_ref().map(|docs| {
-            let unread = docs.read(cx).unseen_document();
-            div()
-                .flex()
-                .gap_2()
-                .px_3()
-                .py_1()
-                .child(
-                    Tabs::new("local-content-tabs")
-                        .track_focus(&content_tabs_focus)
-                        .flex()
-                        .gap_2()
-                        .child(
-                            tab("local-terminal-tab", "Terminal", !document_selected).on_click(
-                                cx.listener(|this, _, window, cx| {
-                                    this.node_details_requested = false;
+        let content_tabs = docs
+            .as_ref()
+            .filter(|docs| !workspace_wide || !layout_controls || docs.read(cx).unseen_document())
+            .map(|docs| {
+                let unread = docs.read(cx).unseen_document();
+                div()
+                    .flex()
+                    .gap_2()
+                    .px_3()
+                    .py_1()
+                    .child(
+                        Tabs::new("local-content-tabs")
+                            .track_focus(&content_tabs_focus)
+                            .flex()
+                            .gap_2()
+                            .child(
+                                tab(
+                                    "local-terminal-tab",
+                                    "Terminal",
+                                    !document_selected,
+                                    gpui_kit::assets::IconName::Terminal,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.node_details_requested = false;
+                                        if let Some(docs) = &this.documents {
+                                            docs.update(cx, |docs, cx| docs.select_terminal(cx));
+                                        }
+                                        this.focus_terminal_input(window, cx);
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                            .child(
+                                tab(
+                                    "local-document-tab",
+                                    if unread { "Document •" } else { "Document" },
+                                    document_selected,
+                                    gpui_kit::assets::IconName::FileText,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        if let Some(docs) = &this.documents {
+                                            docs.update(cx, |docs, cx| {
+                                                docs.select_document(window, cx)
+                                            });
+                                        }
+                                        cx.notify();
+                                    },
+                                )),
+                            ),
+                    )
+                    .when(
+                        workspace_wide
+                            && self.selection.is_some()
+                            && docs.read(cx).has_document()
+                            && !docs.read(cx).has_split_layout(),
+                        |bar| {
+                            bar.child(button("local-split-tab", "Split view", false).on_click(
+                                cx.listener(|this, _, _, cx| {
                                     if let Some(docs) = &this.documents {
-                                        docs.update(cx, |docs, cx| docs.select_terminal(cx));
+                                        docs.update(cx, |docs, _| docs.select_split());
                                     }
-                                    this.focus_terminal_input(window, cx);
                                     cx.notify();
                                 }),
-                            ),
-                        )
-                        .child(
-                            tab(
-                                "local-document-tab",
-                                if unread { "Document •" } else { "Document" },
-                                document_selected,
-                            )
-                            .on_click(cx.listener(
-                                |this, _, window, cx| {
-                                    if let Some(docs) = &this.documents {
-                                        docs.update(cx, |docs, cx| {
-                                            docs.select_document(window, cx)
-                                        });
-                                    }
-                                    cx.notify();
-                                },
-                            )),
-                        ),
-                )
-                .when(
-                    workspace_wide && self.selection.is_some() && docs.read(cx).has_document(),
-                    |bar| {
-                        bar.child(button("local-split-tab", "Side by side", split).on_click(
-                            cx.listener(|this, _, _, cx| {
-                                if let Some(docs) = &this.documents {
-                                    docs.update(cx, |docs, _| docs.select_split());
-                                }
-                                cx.notify();
-                            }),
-                        ))
-                    },
-                )
-        });
+                            ))
+                        },
+                    )
+            });
         let entries = self.entries();
         let empty = entries.is_empty();
         let show_help = self.show_help;
@@ -1044,7 +1068,7 @@ impl Render for LocalGui {
                             .gap_2()
                             .pb_2()
                             .child(
-                                tab("local-sessions-tab", "Sessions", !self.drive_selected)
+                                tab("local-sessions-tab", "Sessions", !self.drive_selected, gpui_kit::assets::IconName::MessageSquare)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.drive_selected = false;
                                         if let Some(focus) = &this.tree_focus { focus.focus(window, cx); }
@@ -1052,7 +1076,7 @@ impl Render for LocalGui {
                                     })),
                             )
                             .child(
-                                tab("local-drive-tab", "Drive", self.drive_selected).on_click(
+                                tab("local-drive-tab", "Drive", self.drive_selected, gpui_kit::assets::IconName::Database).on_click(
                                     cx.listener(|this, _, window, cx| {
                                         this.drive_selected = true;
                                         if let Some(docs) = &this.documents {
@@ -1289,46 +1313,84 @@ impl Render for LocalGui {
                                         .p_4()
                                         .child(
                                             div()
-                                                .id("preview-title")
-                                                .debug_selector(|| "preview-title".into())
-                                                .text_lg()
-                                                .child(title),
-                                        )
-                                        .when_some(detail, |d, detail| {
-                                            d.child(
-                                                div()
-                                                    .text_sm()
-                                                    .text_color(rgb(0xb5beca))
-                                                    .child(detail),
-                                            )
-                                        })
-                                        .child(
-                                            div()
                                                 .flex()
-                                                .items_center()
-                                                .justify_between()
+                                                .items_start()
                                                 .gap_2()
-                                                .py_1()
+                                                .pb_1()
                                                 .child(
                                                     div()
-                                                        .text_sm()
-                                                        .text_color(rgb(
-                                                            if self.preview_failed
-                                                                || (!current
-                                                                    && self
-                                                                        .preview_received
-                                                                        .is_some())
-                                                            {
-                                                                0xe7c279
-                                                            } else {
-                                                                0xb5beca
-                                                            },
-                                                        ))
-                                                        .child(snapshot),
+                                                        .flex()
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .items_center()
+                                                        .flex_wrap()
+                                                        .gap_x_3()
+                                                        .gap_y_1()
+                                                        .child(
+                                                            div()
+                                                                .id("preview-title")
+                                                                .debug_selector(|| "preview-title".into())
+                                                                .max_w_full()
+                                                                .truncate()
+                                                                .text_lg()
+                                                                .child(title),
+                                                        )
+                                                        .when_some(detail, |d, detail| {
+                                                            d.child(
+                                                                div().max_w_full().truncate().text_sm()
+                                                                    .text_color(rgb(0xb5beca))
+                                                                    .child(detail),
+                                                            )
+                                                        })
+                                                        .child(
+                                                            div()
+                                                                .id("preview-status")
+                                                                .debug_selector(|| "preview-status".into())
+                                                                .max_w_full()
+                                                                .text_sm()
+                                                                .text_color(rgb(if self.preview_failed
+                                                                    || (!current && self.preview_received.is_some())
+                                                                {
+                                                                    0xe7c279
+                                                                } else {
+                                                                    0xb5beca
+                                                                }))
+                                                                .child(snapshot),
+                                                        )
+                                                        .when_some(self.live_notice, |d, notice| {
+                                                            d.child(
+                                                                div()
+                                                                    .id("preview-notice")
+                                                                    .debug_selector(|| "preview-notice".into())
+                                                                    .max_w_full()
+                                                                    .text_xs()
+                                                                    .text_color(rgb(0xadcceb))
+                                                                    .child(notice),
+                                                            )
+                                                        }),
                                                 )
+                                                .when(layout_controls, |d| {
+                                                    let maximized = docs.as_ref().is_some_and(|docs| {
+                                                        docs.read(cx).maximized() == Some(browser::Content::Terminal)
+                                                    });
+                                                    d.child(
+                                                        browser::pane_layout_button("terminal-layout", maximized)
+                                                            .track_focus(&terminal_layout_focus)
+                                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                                if let Some(docs) = &this.documents {
+                                                                    docs.update(cx, |docs, cx| {
+                                                                        docs.toggle_pane(browser::Content::Terminal, window, cx);
+                                                                    });
+                                                                }
+                                                                this.focus_terminal_input(window, cx);
+                                                                cx.notify();
+                                                            })),
+                                                    )
+                                                })
                                                 .when(live, |d| {
                                                     d.child(
                                                         action_button("detach-session", "Detach", true)
+                                                            .flex_none()
                                                             .track_focus(&session_action_focus)
                                                             .on_click(cx.listener(
                                                                 |this, _, window, cx| {
@@ -1346,6 +1408,7 @@ impl Render for LocalGui {
                                                 .when(!live && current, |d| {
                                                     d.child(
                                                         action_button("attach-session", "Compose", true)
+                                                            .flex_none()
                                                             .track_focus(&session_action_focus)
                                                             .on_click(cx.listener(
                                                                 |this, _, window, cx| {
@@ -1357,15 +1420,6 @@ impl Render for LocalGui {
                                                     )
                                                 }),
                                         )
-                                        .when_some(self.live_notice, |d, notice| {
-                                            d.child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(rgb(0xadcceb))
-                                                    .pb_1()
-                                                    .child(notice),
-                                            )
-                                        })
                                         .child(
                                             div()
                                                 .id("preview")
@@ -1441,12 +1495,21 @@ impl Render for LocalGui {
     }
 }
 
-fn tab(id: &'static str, text: &'static str, active: bool) -> Tab {
+fn tab(
+    id: &'static str,
+    text: &'static str,
+    active: bool,
+    icon: gpui_kit::assets::IconName,
+) -> Tab {
     Tab::new(id)
         .debug_selector(move || id.into())
         .selected(active)
         .styles(|style| style.selected(|style| style.bg(rgb(0x233e57))))
-        .flex_none()
+        .flex()
+        .flex_1()
+        .items_center()
+        .justify_center()
+        .gap_1()
         .px_2()
         .py_1()
         .rounded_sm()
@@ -1456,6 +1519,7 @@ fn tab(id: &'static str, text: &'static str, active: bool) -> Tab {
         .cursor_pointer()
         .hover(|d| d.bg(rgb(0x34445a)))
         .focus_visible(|d| d.bg(rgb(0x34445a)).text_color(rgb(0xffffff)))
+        .child(icon)
         .child(text)
 }
 
@@ -1511,7 +1575,7 @@ fn button(id: &'static str, text: &'static str, active: bool) -> gpui::Stateful<
         .child(text)
 }
 
-struct FullName(String);
+pub(crate) struct FullName(pub(crate) String);
 
 impl Render for FullName {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
