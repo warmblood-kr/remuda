@@ -382,6 +382,27 @@ fn write_response(stream: &mut crate::ipc::Stream, reply: Vec<u8>) -> std::io::R
     stream.flush()
 }
 
+fn authorize_input(
+    request: &Request,
+    client_id: &str,
+    seq: u64,
+    bytes: &[u8],
+) -> Result<(), String> {
+    if matches!(
+        request,
+        Request::InputLine { .. } | Request::RemoteInputLine { .. }
+    ) && std::str::from_utf8(bytes).is_err()
+    {
+        return Err("input line must be UTF-8".into());
+    }
+    if bytes.len() > MAX_REMOTE_INPUT_BATCH_BYTES {
+        return Err(format!(
+            "remote Input batch exceeds {MAX_REMOTE_INPUT_BATCH_BYTES} bytes"
+        ));
+    }
+    validate_batch(client_id, seq, bytes).map(|_| ())
+}
+
 /// Explicit request allowlist; new variants need a policy decision.
 /// Threat model: Sync is read-only and bounded; Eval and writes stay refused.
 pub fn authorize(request: &Request) -> Result<(), String> {
@@ -410,21 +431,7 @@ pub fn authorize(request: &Request) -> Result<(), String> {
             seq,
             bytes,
             ..
-        } => {
-            if matches!(
-                request,
-                Request::InputLine { .. } | Request::RemoteInputLine { .. }
-            ) && std::str::from_utf8(bytes).is_err()
-            {
-                return Err("input line must be UTF-8".into());
-            }
-            if bytes.len() > MAX_REMOTE_INPUT_BATCH_BYTES {
-                return Err(format!(
-                    "remote Input batch exceeds {MAX_REMOTE_INPUT_BATCH_BYTES} bytes"
-                ));
-            }
-            validate_batch(client_id, *seq, bytes).map(|_| ())
-        }
+        } => authorize_input(request, client_id, *seq, bytes),
         Request::RenderedSessionList { .. } => Err("invalid rendered list width".into()),
         Request::RemoteInput { .. } => Err(refusal("RemoteInput")),
         Request::SetRemoteInputOptOut { .. } => Err(refusal("SetRemoteInputOptOut")),
