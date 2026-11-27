@@ -500,6 +500,18 @@ pub struct NodeMetrics {
     pub cpu_percent: Option<u8>,
     pub memory: Option<ResourceUsage>,
     pub system_disk: Option<ResourceUsage>,
+    /// Build of the daemon serving the sample. Older peers omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_version: Option<String>,
+    /// Build probed from the executable on disk at the daemon’s launch path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_version: Option<String>,
+    /// Whether the actual host inventory is under a system temporary directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_inventory_in_temp: Option<bool>,
+    /// Whether the session host socket directory is temporary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_sockets_in_temp: Option<bool>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]

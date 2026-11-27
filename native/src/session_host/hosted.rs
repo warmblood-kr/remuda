@@ -276,6 +276,31 @@ impl Hosting {
             retiring: Arc::default(),
         }
     }
+    pub(crate) fn temporary_storage(&self) -> (Option<bool>, Option<bool>) {
+        fn in_temp(path: &Path) -> Option<bool> {
+            // Resolve aliases such as /tmp and /var on macOS. Use the
+            // nearest existing ancestor when the socket directory is absent.
+            let path = path
+                .ancestors()
+                .find_map(|parent| parent.canonicalize().ok())?;
+            let system_temp = std::env::temp_dir().canonicalize().ok();
+            let unix_temp = Path::new("/tmp").canonicalize().ok();
+            let unix_var_temp = Path::new("/var/tmp").canonicalize().ok();
+            Some(
+                [system_temp, unix_temp, unix_var_temp]
+                    .into_iter()
+                    .flatten()
+                    .any(|root| path.starts_with(root)),
+            )
+        }
+
+        let inventory = self
+            .state_root()
+            .ok()
+            .and_then(|root| in_temp(&root.join("inventory")));
+        (inventory, in_temp(&self.socket_root))
+    }
+
     pub(crate) fn split_state_root(&self) -> io::Result<Option<PathBuf>> {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         if let Some(socket) = &self.socket {
