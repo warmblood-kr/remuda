@@ -232,12 +232,66 @@ fn launch(binding: PathBuf, cwd: PathBuf, status: Option<PathBuf>) -> Result<Exi
         version: &info.version,
     });
     cleanup.manifest = Some(create_manifest(&directory, &name, &manifest)?);
-    if let Some(path) = status.as_ref() {
-        let _ = fs::write(path, "MODEL:? CTX:? CTXWIN:? CTXPCT:?\n");
-    }
+    let (stop, stopped) = mpsc::channel();
+    let monitor = status.map(|path| {
+        let endpoint = format!("{url}/api/session/{conversation}");
+        let password = password.clone();
+        let conversation = conversation.clone();
+        std::thread::spawn(move || {
+            monitor_model(&endpoint, &password, &conversation, &path, stopped)
+        })
+    });
     let code = run_tui(&opencode, &url, &conversation, &cwd, &password);
+    drop(stop);
     drop(cleanup);
+    if let Some(monitor) = monitor {
+        let _ = monitor.join();
+    }
     Ok(code)
+}
+
+fn monitor_model(
+    endpoint: &str,
+    password: &str,
+    conversation: &str,
+    status: &Path,
+    stopped: mpsc::Receiver<()>,
+) {
+    let mut published = String::new();
+    loop {
+        if let Some(model) = read_session_model(endpoint, password, conversation) {
+            if model != published
+                && fs::write(status, format!("MODEL:{model} CTX:? CTXWIN:? CTXPCT:?\n")).is_ok()
+            {
+                published = model;
+            }
+        }
+        if stopped.recv_timeout(Duration::from_secs(2)) != Err(mpsc::RecvTimeoutError::Timeout) {
+            return;
+        }
+    }
+}
+
+fn read_session_model(endpoint: &str, password: &str, conversation: &str) -> Option<String> {
+    let response = request(endpoint.to_owned(), "GET", password, String::new()).ok()?;
+    if response.status != 200 {
+        return None;
+    }
+    let payload = serde_json::from_slice(&response.body).ok()?;
+    session_model(&payload, conversation).map(str::to_owned)
+}
+
+fn session_model<'a>(payload: &'a Value, conversation: &str) -> Option<&'a str> {
+    if payload.pointer("/data/id")?.as_str()? != conversation {
+        return None;
+    }
+    payload.pointer("/data/model/id")?.as_str().filter(|id| {
+        !id.is_empty()
+            && id.len() <= 256
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_.:/+-".contains(&byte))
+    })
 }
 
 fn env_value(name: &str) -> Result<String, String> {
@@ -779,6 +833,22 @@ fn random_hex(bytes: usize) -> Result<String, String> {
 mod tests {
     use super::*;
     use remuda_native::find_command::Refusal;
+
+    #[test]
+    fn reads_only_the_fixed_sessions_current_model() {
+        let mut response = json!({"data": {"id": "ses_main"}});
+        assert_eq!(session_model(&response, "ses_main"), None);
+        response["data"]["model"] = json!({"id": "gpt-5.4", "providerID": "openai"});
+        assert_eq!(session_model(&response, "ses_main"), Some("gpt-5.4"));
+        response["data"]["model"]["id"] = json!("vendor/next:model");
+        assert_eq!(
+            session_model(&response, "ses_main"),
+            Some("vendor/next:model")
+        );
+        assert_eq!(session_model(&response, "ses_other"), None);
+        response["data"]["model"]["id"] = json!("bad\nstatus");
+        assert_eq!(session_model(&response, "ses_main"), None);
+    }
 
     #[test]
     fn opencode_resolution_prefers_path_then_the_per_user_install() {

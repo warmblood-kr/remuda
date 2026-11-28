@@ -480,7 +480,15 @@ fn monitor_with_key(socket: &std::path::Path, status: &str, key: Option<&str>) {
     let Ok(mut stream) = websocket_handshake(stream, key) else {
         return;
     };
-    let initialize = json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"remuda-butler","version":env!("CARGO_PKG_VERSION")}}});
+    // The app-server gates thread/settings/updated behind experimentalApi.
+    let initialize = json!({
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "clientInfo": {"name": "remuda-butler", "version": env!("CARGO_PKG_VERSION")},
+            "capabilities": {"experimentalApi": true}
+        }
+    });
     if websocket_send_text(&mut stream, &initialize.to_string()).is_err() {
         return;
     }
@@ -542,6 +550,14 @@ fn monitor_with_key(socket: &std::path::Path, status: &str, key: Option<&str>) {
                     }
                 }
             }
+        }
+        if event.get("method").and_then(Value::as_str) == Some("thread/settings/updated")
+            && !event
+                .pointer("/params/threadId")
+                .and_then(Value::as_str)
+                .is_some_and(|id| persistent_threads.contains(id))
+        {
+            continue;
         }
         update_status(&event, &mut model, status);
     }
@@ -821,6 +837,16 @@ fn update_status(event: &Value, model: &mut String, status: &str) {
             }
             write_status(status, model, "?", "?");
         }
+        Some("thread/settings/updated") => {
+            if let Some(value) = event
+                .pointer("/params/threadSettings/model")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty() && *value != model.as_str())
+            {
+                *model = value.into();
+                write_status(status, model, "?", "?");
+            }
+        }
         Some("thread/tokenUsage/updated") => {
             let usage = &event["params"]["tokenUsage"];
             let Some(window) = usage["modelContextWindow"].as_u64() else {
@@ -1095,6 +1121,10 @@ mod tests {
                 serde_json::from_str(&test_read_client_text(&mut stream)).unwrap();
             assert_eq!(initialize["id"], 1);
             assert_eq!(initialize["method"], "initialize");
+            assert_eq!(
+                initialize["params"]["capabilities"]["experimentalApi"],
+                true
+            );
             test_write_server_text(&mut stream, r#"{"id":1,"result":{}}"#);
 
             let initialized: Value =
@@ -1124,6 +1154,14 @@ mod tests {
                 &mut stream,
                 r#"{"method":"thread/status/changed","params":{"threadId":"01a0e074-2cc9-7800-b5cc-44c2d192d539","status":{"type":"idle"}}}"#,
             );
+            test_write_server_text(
+                &mut stream,
+                r#"{"method":"thread/settings/updated","params":{"threadId":"01a0e074-2cc9-7800-b5cc-44c2d192d539","threadSettings":{"model":"gpt-test-Y"}}}"#,
+            );
+            test_write_server_text(
+                &mut stream,
+                r#"{"method":"thread/settings/updated","params":{"threadId":"background","threadSettings":{"model":"gpt-test-Z"}}}"#,
+            );
             test_write_server_text(&mut stream, LIVE_USAGE_FRAME);
         });
 
@@ -1131,7 +1169,7 @@ mod tests {
         server.join().unwrap();
         assert_eq!(
             std::fs::read_to_string(&status_path).unwrap(),
-            "MODEL:gpt-test-X CTX:25253 CTXWIN:258400 CTXPCT:9\n"
+            "MODEL:gpt-test-Y CTX:25253 CTXWIN:258400 CTXPCT:9\n"
         );
         let _ = std::fs::remove_file(socket_path);
         let _ = std::fs::remove_file(status_path);
