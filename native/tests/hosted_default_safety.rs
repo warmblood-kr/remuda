@@ -352,3 +352,42 @@ fn force_close_uses_the_verified_host_when_all_metadata_is_missing() {
     assert_ne!(daemon.shell("lost"), instance_id);
     assert!(daemon.cli(&["stop", "-f"]).status.success());
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn force_close_releases_a_stale_reservation_without_owner_metadata() {
+    let daemon = Parity::start(Mode::Default);
+    let stale = daemon.shell("stale");
+    let control = daemon.shell("control");
+    let root = daemon.root().join("remuda/s.sock.hosts");
+    let (endpoint, owner) = std::fs::read_dir(root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find_map(|entry| {
+            let file = std::fs::read(entry.path().join("owner.json")).ok()?;
+            let owner: serde_json::Value = serde_json::from_slice(&file).ok()?;
+            (owner["identity"]["instance"] == stale).then(|| (entry.path(), owner))
+        })
+        .expect("owned test endpoint");
+    for file in ["capability", "owner.json", "session.json"] {
+        std::fs::remove_file(endpoint.join(file)).unwrap();
+    }
+    for key in ["child", "host"] {
+        let pid = i32::try_from(owner[key].as_i64().unwrap()).unwrap();
+        assert!(pid > 1);
+        // SAFETY: both PIDs belong to this isolated test session.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let forgotten = daemon.cli(&["force-close", "stale", "--yes"]);
+        if forgotten.status.success() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{forgotten:?}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(instance(&daemon, "control"), control);
+    assert_ne!(daemon.shell("stale"), stale);
+    assert!(daemon.cli(&["stop", "-f"]).status.success());
+}

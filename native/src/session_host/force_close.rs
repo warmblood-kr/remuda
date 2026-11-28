@@ -70,15 +70,65 @@ fn process_identity(pid: libc::pid_t) -> io::Result<UniqueProcess> {
     Ok(unsafe { info.assume_init() })
 }
 
-fn verify_host_executable(pid: libc::pid_t) -> io::Result<()> {
-    let mut path = [0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-    // SAFETY: path points to a writable buffer of the supplied size.
-    if unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) } <= 0 {
+fn saved_executable(pid: libc::pid_t, endpoint: &Path) -> io::Result<std::ffi::OsString> {
+    // The reserved host has three short arguments and a fixed environment.
+    let mut args = vec![0_u8; 64 * 1024];
+    let mut len = args.len();
+    let query = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    // SAFETY: both the MIB and the output buffer remain live through sysctl.
+    let result = unsafe {
+        libc::sysctl(
+            query.as_ptr() as *mut libc::c_int,
+            query.len() as libc::c_uint,
+            args.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 {
         return Err(io::Error::last_os_error());
     }
-    let path = Path::new(std::ffi::OsStr::from_bytes(
-        path.split(|byte| *byte == 0).next().unwrap_or_default(),
-    ));
+    let executable = reserved_executable(&args[..len], endpoint)
+        .ok_or_else(|| refused("saved host launch does not match the reserved endpoint"))?;
+    Ok(std::ffi::OsStr::from_bytes(executable).to_os_string())
+}
+
+fn reserved_executable<'a>(args: &'a [u8], endpoint: &Path) -> Option<&'a [u8]> {
+    let (count, args) = args.split_first_chunk::<4>()?;
+    if i32::from_ne_bytes(*count) != 3 {
+        return None;
+    }
+    let separator = args.iter().position(|byte| *byte == 0)?;
+    let (executable, tail) = args.split_at(separator);
+    let start = tail.iter().position(|byte| *byte != 0)?;
+    let mut argv = tail[start..].split_inclusive(|byte| *byte == 0);
+    let mut arg = || argv.next()?.strip_suffix(&[0]);
+    if !executable.starts_with(b"/")
+        || arg()? != executable
+        || arg()? != b"run-reserved"
+        || arg()? != endpoint.as_os_str().as_bytes()
+    {
+        return None;
+    }
+    Some(executable)
+}
+
+fn verify_host_executable(pid: libc::pid_t, endpoint: &Path) -> io::Result<()> {
+    let mut path = [0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: path points to a writable buffer of the supplied size.
+    let result = unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
+    let path = if result > 0 {
+        std::ffi::OsStr::from_bytes(path.split(|byte| *byte == 0).next().unwrap_or_default())
+            .to_os_string()
+    } else {
+        let error = io::Error::last_os_error();
+        if !matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) {
+            return Err(error);
+        }
+        saved_executable(pid, endpoint)?
+    };
+    let path = Path::new(&path);
     let name = path.file_name().and_then(std::ffi::OsStr::to_str);
     let daemon = std::env::current_exe()?;
     let daemon = super::host_build::profile_daemon(&daemon).unwrap_or(daemon);
@@ -170,17 +220,52 @@ fn stop_process(token: AuditToken) -> io::Result<()> {
     }
 }
 
+fn at_stage(stage: &str, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{stage}: {error}"))
+}
+
 pub(super) fn end(endpoint: &Path) -> io::Result<()> {
-    let stream = super::unix::connect_for_process_inspection(endpoint)?;
-    let token = peer_token(&stream)?;
+    let stream = super::unix::connect_for_process_inspection(endpoint)
+        .map_err(|error| at_stage("session host socket", error))?;
+    let token = peer_token(&stream).map_err(|error| at_stage("session host socket peer", error))?;
     let pid = token[PID] as libc::pid_t;
     let identity = process_identity(pid)?;
     if identity.pid_version as u32 != token[VERSION] {
         return Err(refused("the endpoint peer was replaced"));
     }
-    verify_host_executable(pid)?;
-    if let Some(child) = direct_child(pid, &identity)? {
-        stop_process(child)?;
+    verify_host_executable(pid, endpoint)
+        .map_err(|error| at_stage("session host executable lookup", error))?;
+    if process_identity(pid)?.pid_version as u32 != token[VERSION] {
+        return Err(refused(
+            "the endpoint peer was replaced during executable lookup",
+        ));
     }
-    stop_process(token)
+    if let Some(child) = direct_child(pid, &identity)? {
+        stop_process(child).map_err(|error| at_stage("terminate session child", error))?;
+    }
+    stop_process(token).map_err(|error| at_stage("terminate session host", error))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saved_launch_requires_the_original_executable_and_exact_endpoint() {
+        let mut args = 3_i32.to_ne_bytes().to_vec();
+        let executable = b"/install/remuda-session-host-old";
+        args.extend_from_slice(executable);
+        args.extend_from_slice(b"\0\0");
+        args.extend_from_slice(executable);
+        args.extend_from_slice(b"\0run-reserved\0/tmp/session\0PATH=ignored\0");
+        assert_eq!(
+            reserved_executable(&args, Path::new("/tmp/session")),
+            Some(executable.as_slice())
+        );
+        assert_eq!(reserved_executable(&args, Path::new("/tmp/other")), None);
+        assert_eq!(
+            reserved_executable(&args[..args.len() - 14], Path::new("/tmp/session")),
+            None
+        );
+    }
 }

@@ -635,7 +635,7 @@ fn force_close_command(path: &Path, args: &[&str]) -> ExitCode {
     use remuda_native::cli_parse::{ArgSpec, OptionSpec};
     let spec = simple_cli_spec(
         "force-close",
-        "Force a local macOS session and its host to exit, even if host credentials are missing",
+        "Force-close a local macOS session or release its stale reservation",
         vec![ArgSpec {
             name: "SESSION".into(),
             help: "Exact session name".into(),
