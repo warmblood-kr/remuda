@@ -381,9 +381,9 @@ impl Owner {
         super::unix::remove_owner_record(endpoint, &entry.identity);
         Ok(true)
     }
-    /// Called only after OS-confirmed termination of both verified processes.
+    /// Called after verified process termination or an explicit stale-listener removal.
     #[cfg(target_os = "macos")]
-    pub(super) fn retire_force_closed(&self, target: &Target) -> Result<(), Error> {
+    pub(super) fn retire_confirmed_removal(&self, target: &Target) -> Result<(), Error> {
         let until = std::time::Instant::now() + Duration::from_secs(1);
         loop {
             let index = self.store.read()?;

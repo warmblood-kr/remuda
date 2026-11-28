@@ -714,8 +714,8 @@ impl Hosting {
             .get(name)
             .filter(|entry| entry.identity.instance == instance)
             .ok_or("session instance is no longer current")?;
-        if !matches!(entry.phase, Phase::Registered) {
-            return Err("only a published live instance can be force-closed".into());
+        if matches!(entry.phase, Phase::Reserved) {
+            return Err("only a published instance can be force-closed".into());
         }
         let birth = entry
             .birth
@@ -729,11 +729,24 @@ impl Hosting {
             name: name.into(),
             identity: entry.identity.clone(),
         };
-        super::force_close::end(endpoint).map_err(|error| format!("force close: {error}"))?;
+        let key = endpoint.file_name().ok_or("session endpoint has no name")?;
+        let runtime_socket = hosts.socket_root.join(key).join("socket");
+        if super::unix::stale_listener(endpoint, &runtime_socket) {
+            if super::unix::recorded_owner(endpoint, &entry.identity).is_ok_and(|owner| {
+                !super::unix::owner_exited(owner.host)
+                    || owner
+                        .child
+                        .is_some_and(|pid| !super::unix::owner_exited(pid as libc::pid_t))
+            }) {
+                return Err("force close refused: the stale socket has a recorded process that may still be alive".into());
+            }
+        } else {
+            super::force_close::end(endpoint).map_err(|error| format!("force close: {error}"))?;
+        }
         hosts
             .owner
-            .retire_force_closed(&target)
-            .map_err(|error| format!("processes ended, but inventory cleanup failed: {error:?}"))?;
+            .retire_confirmed_removal(&target)
+            .map_err(|error| format!("session inventory cleanup failed: {error:?}"))?;
         let mut open = hosts.open.lock().unwrap_or_else(|error| error.into_inner());
         if open
             .get(name)

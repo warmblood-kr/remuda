@@ -489,6 +489,26 @@ pub(super) fn connect_for_process_inspection(path: &Path) -> io::Result<UnixStre
     Ok(stream)
 }
 
+#[cfg(target_os = "macos")]
+pub(super) fn stale_listener(path: &Path, runtime_socket: &Path) -> bool {
+    let Ok(socket) = socket_path(path) else {
+        return false;
+    };
+    let refused_socket = |candidate: &Path| {
+        let Ok(info) = std::fs::symlink_metadata(candidate) else {
+            return false;
+        };
+        info.file_type().is_socket()
+            && info.uid() == uid()
+            && info.mode() & 0o7777 == 0o600
+            && connect_until(candidate, Instant::now() + Duration::from_millis(100))
+                .is_err_and(|error| error.kind() == io::ErrorKind::ConnectionRefused)
+    };
+    directory(path).is_ok()
+        && (socket == runtime_socket && refused_socket(&socket)
+            || socket != runtime_socket && refused_socket(runtime_socket) && listener_missing(path))
+}
+
 fn connect_until(path: &Path, until: Instant) -> io::Result<UnixStream> {
     use std::os::fd::{FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
